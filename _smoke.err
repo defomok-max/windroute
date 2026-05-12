@@ -1,0 +1,10 @@
+[WARN] Language Server binary not found: C:\nonexistent\language_server_windows_x64.exe
+[WARN] Dashboard and /auth/login will still work.
+[WARN] Fix: run scripts\detect-ls.ps1, or edit .env → LS_BINARY_PATH
+[WARN] Language server binary not found: C:\nonexistent\language_server_windows_x64.exe
+[WARN] Run scripts\detect-ls.ps1 or set LS_BINARY_PATH in .env
+[WARN] No accounts configured. Add via POST /auth/login
+[WARN] No accounts configured. Add via:
+[WARN]   Dashboard → Accounts → Add
+[WARN]   POST /auth/login {"token":"..."}
+[WARN] Get a Windsurf token: https://windsurf.com/editor/show-auth-token
