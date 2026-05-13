@@ -1,13 +1,25 @@
 {
   "name": "windbu",
   "version": "1.0.0",
-  "description": "Local gateway for Windsurf AI — one OpenAI/Anthropic-compatible endpoint over multiple Windsurf accounts. Windows-only.",
-  "private": true,
+  "description": "Local gateway for Windsurf AI — one OpenAI/Anthropic-compatible endpoint over multiple Windsurf accounts. Works with Claude Code, Cursor, Cline, OpenCode, any custom-endpoint client.",
   "type": "module",
   "main": "src/index.js",
+  "bin": {
+    "windbu": "bin/windbu.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/",
+    ".env.example",
+    "README.md",
+    "CREDITS.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node src/index.js",
+    "start": "node bin/windbu.mjs",
+    "dev": "node bin/windbu.mjs",
+    "install-cli": "node bin/windbu.mjs install",
     "check": "node --check src/index.js && node --check src/server.js && node --check src/auth.js",
     "smoke": "node scripts/smoke.mjs"
   },
@@ -24,7 +36,8 @@
     "proxy",
     "pool",
     "claude-code",
-    "cursor"
+    "cursor",
+    "cli"
   ],
   "homepage": "https://github.com/defomok-max/windroute",
   "repository": {

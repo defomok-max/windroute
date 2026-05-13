@@ -1,125 +1,162 @@
 # windbu
 
-Local gateway для [Windsurf AI](https://windsurf.com) под Windows. Берёт один или несколько Windsurf-токенов и отдаёт их как единый OpenAI/Anthropic-совместимый API. Подключи к Claude Code, Cursor, Cline, OpenCode — любому клиенту с custom OpenAI endpoint.
+**Локальный gateway для [Windsurf AI](https://windsurf.com).**
+Один OpenAI/Anthropic-совместимый endpoint поверх нескольких Windsurf-аккаунтов. Подключи Claude Code, Cursor, Cline, OpenCode, Continue, RooCode, Droid, Kilo Code — любой клиент с custom endpoint.
 
-Проект навеян [decolua/9router](https://github.com/decolua/9router). Основан на [guanxiaol/WindsurfPoolAPI](https://github.com/guanxiaol/WindsurfPoolAPI) и [dwgx/WindsurfAPI](https://github.com/dwgx/WindsurfAPI) (attribution в [CREDITS.md](CREDITS.md)).
-
----
-
-## Что умеет
-
-- **OpenAI /v1/chat/completions + /v1/responses** — любой клиент с custom OpenAI endpoint.
-- **Anthropic /v1/messages** — Claude Code подключается через `ANTHROPIC_BASE_URL`.
-- **Multi-account pool** — добавляй сколько угодно Windsurf-токенов, запросы распределяются round-robin.
-- **Единый API key для всех клиентов** — генерируется при установке.
-- **Streaming (SSE)** — стримится с первой же секунды.
-- **Web dashboard** — http://127.0.0.1:20129/dashboard, управление аккаунтами, прокси, аналитика.
-- **OAuth login (Google/GitHub)** — через дашборд, вместо ручного копирования токена.
-- **Per-account HTTP/SOCKS5 proxy** — для распределения нагрузки по разным IP.
-- **Usage analytics** — токены, credits, распределение по моделям и аккаунтам.
-- **Persistent storage** — `%USERPROFILE%\.windbu\` (аккаунты, статистика, логи).
-- **Автостарт при логине** (опционально).
-- **100+ моделей** — Claude Opus/Sonnet/Haiku, GPT-5.x, Gemini 3, DeepSeek, Grok, Qwen, Kimi, GLM.
+> Одна команда для установки. Ноль настроек для первого запуска. Работает на Windows (primary), macOS, Linux, Docker.
 
 ---
 
-## Установка (~1 минута)
+## 🚀 Быстрый старт
 
-Нужно:
-- Windows 10/11
-- Node.js ≥ 20 ([скачать](https://nodejs.org/))
-- Установленный [Windsurf](https://windsurf.com) (или отдельно `language_server_windows_x64.exe`)
+### Windows (одна команда)
 
 ```powershell
-cd D:\portfolio\project\windbu
+git clone https://github.com/defomok-max/windroute.git windbu
+cd windbu
+node bin/windbu.mjs
+```
+
+Всё. Откроется дашборд на http://127.0.0.1:20129/dashboard, API ключ и пароль будут в терминале и в `%USERPROFILE%\.windbu\credentials.txt`.
+
+Что происходит на первом запуске:
+
+1. Автодетект Windsurf Language Server в 5 стандартных местах
+2. Генерация случайного `API_KEY` (`sk-windbu-...`) и пароля дашборда
+3. Запись `.env`, создание `%USERPROFILE%\.windbu\`
+4. Запуск gateway + открытие дашборда в браузере
+5. Добавление первого токена в пул через UI
+
+### Docker
+
+```bash
+docker run -d \
+  --name windbu \
+  -p 20129:20129 \
+  -v "$HOME/.windbu:/data" \
+  ghcr.io/defomok-max/windroute:latest
+```
+
+Дашборд: http://localhost:20129/dashboard
+
+Для работы чата нужен Windsurf LS — смонтируй бинарь и укажи `-e LS_BINARY_PATH=/path/to/language_server_linux_x64`.
+
+### Установщик на Windows с полным UX
+
+Если хочешь ярлык на рабочем столе, автостарт и прочее:
+
+```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1
 ```
 
-Что происходит:
-1. Проверяется Node.js.
-2. Автоматически ищется Language Server Windsurf в 5 стандартных местах.
-3. Генерируются случайные `API_KEY` и `DASHBOARD_PASSWORD`, пишется `.env`.
-4. Создаётся ярлык `windbu` на рабочем столе.
-5. Спрашивается про автозапуск при логине.
-6. Сервер поднимается, открывается дашборд в браузере.
-7. `API_KEY` копируется в буфер обмена, всё пишется в `%USERPROFILE%\.windbu\credentials.txt`.
+---
+
+## 🎯 Что умеет
+
+| Функция | Описание |
+|---------|----------|
+| **OpenAI chat/completions + Responses** | Cursor, Cline, OpenCode, Aider — любой custom-endpoint клиент |
+| **Anthropic /v1/messages** | Claude Code подключается через `ANTHROPIC_BASE_URL` |
+| **Multi-account pool** | Круговая балансировка, tier-weighted RPM, автодисейбл при ошибках |
+| **Единый API-key** | Один ключ для всех клиентов, генерится автоматически |
+| **Streaming (SSE)** | Первый байт летит сразу, heartbeat для keepalive |
+| **Web dashboard** | Аккаунты, прокси, аналитика, логи — всё через UI |
+| **OAuth login** | Google / GitHub через Firebase, без ручного копирования токена |
+| **Per-account прокси** | HTTP/SOCKS5, каждый аккаунт — свой IP |
+| **Usage analytics** | Токены, credits, распределение по моделям и аккаунтам |
+| **Persistent storage** | `%USERPROFILE%\.windbu\` (переживает рестарт) |
+| **Автостарт** | Опционально, через ярлык в Startup |
+| **100+ моделей** | Claude Opus/Sonnet/Haiku, GPT-5.x, Gemini 3, DeepSeek, Grok, Qwen, Kimi, GLM |
 
 ---
 
-## Первые шаги после установки
+## 🔌 Подключение клиентов
 
-### 1. Добавить Windsurf-токен
+### Claude Code
 
-Токен берётся здесь: https://windsurf.com/editor/show-auth-token
-
-Способ А — дашборд:
-- Открой http://127.0.0.1:20129/dashboard
-- Войди паролем (показан в терминале и в `credentials.txt`)
-- **Accounts → Add → вставь токен → OK**
-
-Способ Б — CLI:
-
-```powershell
-.\scripts\add-account.ps1 -Token 'ott$XXXXXX...'
-```
-
-### 2. Подключить клиента
-
-**Claude Code:**
-```powershell
+```bash
+# Windows PowerShell
 $env:ANTHROPIC_BASE_URL = 'http://127.0.0.1:20129'
 $env:ANTHROPIC_API_KEY = '<API_KEY из credentials.txt>'
 claude
+
+# macOS / Linux
+export ANTHROPIC_BASE_URL='http://127.0.0.1:20129'
+export ANTHROPIC_API_KEY='<API_KEY>'
+claude
 ```
 
-**Cursor:** Settings → Models → Custom OpenAI:
-- Base URL: `http://127.0.0.1:20129/v1`
-- API Key: `<API_KEY>`
-- Model: `claude-sonnet-4.6`, `gpt-5.2-high`, `gemini-3.0-pro`, и т.д.
+### Cursor
 
-**Cline / Roo / Aider** и прочие OpenAI-совместимые — то же самое.
+Settings → Models → Custom OpenAI:
+- **Base URL:** `http://127.0.0.1:20129/v1`
+- **API Key:** `<API_KEY>`
+- **Model:** `claude-sonnet-4.6`, `gpt-5.2-high`, `gemini-3.0-pro`, и т.д.
 
-> Cursor фильтрует имена моделей, в которых есть слово `claude`. Используй алиасы: `sonnet-4.6`, `opus-4.6`, `opus-4.7` — они работают без фильтра.
+> Cursor фильтрует имена моделей со словом `claude`. Используй алиасы: `sonnet-4.6`, `opus-4.6`, `opus-4.7-max` — они работают без фильтра.
 
-### 3. Проверить что работает
+### Cline / Continue / RooCode / OpenCode / Aider
 
-```powershell
-# Модели
-curl http://127.0.0.1:20129/v1/models -H "Authorization: Bearer <API_KEY>"
+```
+Provider: OpenAI Compatible
+Base URL: http://127.0.0.1:20129/v1
+API Key:  <API_KEY>
+Model:    claude-sonnet-4.6
+```
+
+### Быстрая проверка
+
+```bash
+# Список моделей
+curl http://127.0.0.1:20129/v1/models \
+  -H "Authorization: Bearer <API_KEY>"
 
 # Чат
-curl http://127.0.0.1:20129/v1/chat/completions `
-  -H "Content-Type: application/json" `
-  -H "Authorization: Bearer <API_KEY>" `
+curl http://127.0.0.1:20129/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <API_KEY>" \
   -d '{"model":"claude-sonnet-4.6","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ---
 
-## Команды
+## 📋 CLI команды
 
-| Команда | Что делает |
+```
+windbu                   запустить gateway (auto-configure при первом запуске)
+windbu start             то же самое
+windbu install           интерактивный installer с ярлыком и автостартом (Windows)
+windbu stop              остановить любой запущенный процесс
+windbu login <token>     добавить Windsurf-токен в пул
+windbu dashboard         открыть дашборд в браузере
+windbu doctor            preflight-проверки (node, порт, data dir, LS binary)
+windbu version           версия
+windbu help              справка
+```
+
+### PowerShell-скрипты (Windows-специфичные)
+
+| Скрипт | Что делает |
 |---|---|
-| `.\scripts\install.ps1` | Первая установка (idempotent, re-run безопасен) |
+| `.\scripts\install.ps1` | Полный installer — ярлык, автостарт, OAuth, тест чата |
 | `.\scripts\install.ps1 -Force` | Перегенерирует `.env` с новыми ключами |
-| `.\scripts\start.ps1` | Запуск вручную (с watchdog'ом) |
-| `.\scripts\start.ps1 -NoWatchdog` | Запуск без авто-restart'а |
-| `.\scripts\stop.ps1` | Остановка |
+| `.\scripts\start.ps1` | Запуск с watchdog'ом (auto-restart на crash) |
+| `.\scripts\stop.ps1` | Остановка + kill LS children |
 | `.\scripts\add-account.ps1 -Token '...'` | Добавить токен через CLI |
-| `.\scripts\detect-ls.ps1` | Вывести путь к Language Server |
+| `.\scripts\detect-ls.ps1` | Вывести путь к Windsurf LS |
 | `.\scripts\download-ls.ps1` | Скачать LS-бинарь (~170 MB) |
-| `.\scripts\enable-autostart.ps1` | Включить автозапуск при логине |
+| `.\scripts\enable-autostart.ps1` | Автозапуск при логине |
 | `.\scripts\disable-autostart.ps1` | Выключить автозапуск |
-| `.\scripts\uninstall.ps1` | Снести автозапуск + ярлык + данные |
-| `node scripts/smoke.mjs` | Прогнать smoke-тесты (~2с, 21 проверка) |
+| `.\scripts\uninstall.ps1` | Снести всё: автостарт, ярлык, данные |
+| `node scripts/smoke.mjs` | 21 smoke-тест (varint, cache, SSRF, pool, auth) |
 
 ---
 
-## API endpoints
+## 🌐 API endpoints
 
 | Путь | Формат | Кто использует |
-|---|---|---|
-| `POST /v1/chat/completions` | OpenAI chat | Cursor, Cline, Aider, OpenCode |
+|------|--------|----------------|
+| `POST /v1/chat/completions` | OpenAI chat | Cursor, Cline, Aider, OpenCode, Continue |
 | `POST /v1/messages` | Anthropic messages | Claude Code, Claude SDK |
 | `POST /v1/responses` | OpenAI Responses | OpenAI SDK v2 |
 | `GET /v1/models` | OpenAI models list | все |
@@ -133,51 +170,65 @@ curl http://127.0.0.1:20129/v1/chat/completions `
 
 ---
 
-## Конфиг
+## ⚙️ Конфигурация
 
-`.env` в корне проекта. Смотри `.env.example` для всех переменных.
+`.env` генерится автоматически при первом запуске. Правь руками если нужно:
 
-- `PORT` (20129) — порт HTTP-сервера
-- `HOST` (127.0.0.1) — биндинг (локал, не светится в LAN)
-- `API_KEY` — ключ для клиентов
-- `DASHBOARD_PASSWORD` — пароль дашборда
-- `LS_BINARY_PATH` — путь к `language_server_windows_x64.exe`
-- `LS_PORT` (42100) — gRPC-порт Language Server (внутренний)
-- `DEFAULT_MODEL` — если клиент не передал `model`
-- `LOG_LEVEL` — `debug` / `info` / `warn` / `error`
-- `WINDBU_DATA_DIR` — корень данных (по умолчанию `%USERPROFILE%\.windbu`)
+| Переменная | Default | Что делает |
+|-----------|---------|------------|
+| `PORT` | `20129` | порт HTTP-сервера |
+| `HOST` | `127.0.0.1` | биндинг (локал по умолчанию, не светится в LAN) |
+| `API_KEY` | `sk-windbu-*` | ключ для клиентов |
+| `DASHBOARD_PASSWORD` | auto | пароль дашборда |
+| `LS_BINARY_PATH` | auto-detect | путь к `language_server_*.exe` |
+| `LS_PORT` | `42100` | gRPC-порт LS (внутренний) |
+| `DEFAULT_MODEL` | `claude-sonnet-4.6` | если клиент не передал `model` |
+| `MAX_TOKENS` | `8192` | максимум токенов в ответе по умолчанию |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `WINDBU_DATA_DIR` | `%USERPROFILE%\.windbu` | корень данных |
+| `CODEIUM_API_URL` | `https://server.self-serve.windsurf.com` | не меняй |
 
 ---
 
-## Структура данных
+## 📂 Структура данных
 
 ```
-%USERPROFILE%\.windbu\
-├── accounts.json       — пул Windsurf-токенов
-├── proxy.json          — proxy-настройки
-├── stats.json          — usage analytics
-├── runtime-config.json — experimental flags, identity prompts
-├── model-access.json   — allow/block списки моделей
-├── credentials.txt     — один раз при установке: API_KEY + DASHBOARD_PASSWORD
-├── windbu.pid          — PID текущего процесса
-├── workspace\          — временная рабочая область LS (чистится при старте)
-├── ls-data\            — data-dir LS (по инстансу на прокси)
-└── logs\
+%USERPROFILE%\.windbu\        (Windows)
+~/.windbu/                    (macOS / Linux)
+├── accounts.json             — пул Windsurf-токенов
+├── proxy.json                — proxy-настройки
+├── stats.json                — usage analytics (v2 schema)
+├── runtime-config.json       — experimental flags, identity prompts
+├── model-access.json         — allow/block списки моделей
+├── credentials.txt           — один раз при установке: API_KEY + пароль
+├── windbu.pid                — PID текущего процесса
+├── workspace/                — рабочая область LS (чистится при старте)
+├── ls-data/                  — data-dir LS (по инстансу на прокси)
+├── ls/                       — скачанный LS-бинарь (если через download-ls.ps1)
+└── logs/
     ├── app-YYYY-MM-DD.jsonl
     └── error-YYYY-MM-DD.jsonl
 ```
 
 ---
 
-## Troubleshooting
+## 🧩 Как получить Windsurf-токен
+
+1. Открой https://windsurf.com/editor/show-auth-token
+2. Залогинься (если ещё нет), скопируй токен (`ott$...` или JWT)
+3. Добавь в пул:
+   - **Дашборд:** Accounts → Add → вставь токен → OK
+   - **CLI:** `node bin/windbu.mjs login '<token>'`
+   - **PowerShell:** `.\scripts\add-account.ps1 -Token '<token>'`
+
+Добавлять можно сколько угодно — запросы будут распределяться round-robin с учётом tier (free / pro) и RPM-лимитов.
+
+---
+
+## 🐛 Troubleshooting
 
 **`Language server binary not found`**
-Установи Windsurf с официального сайта, или вручную пропиши полный путь в `.env` → `LS_BINARY_PATH`.
-`detect-ls.ps1` ищет в:
-- `%LOCALAPPDATA%\Programs\Windsurf\resources\app\extensions\windsurf\bin\`
-- `%APPDATA%\Windsurf\bin\`
-- `%LOCALAPPDATA%\Windsurf\bin\`
-- `%ProgramFiles%\Windsurf\resources\app\extensions\windsurf\bin\`
+Установи [Windsurf](https://windsurf.com) или запусти `.\scripts\download-ls.ps1`. Альтернатива — укажи полный путь в `.env` → `LS_BINARY_PATH`.
 
 **`Port 20129 already in use`**
 ```powershell
@@ -187,22 +238,64 @@ Get-NetTCPConnection -LocalPort 20129 | Select-Object OwningProcess
 ```
 
 **`No accounts available`**
-Добавь хотя бы один Windsurf-токен — дашборд или `add-account.ps1`.
+Добавь хотя бы один токен — см. раздел выше.
 
 **Cursor не видит claude-модели**
-Используй алиасы без слова "claude": `sonnet-4.6`, `opus-4.6`, `haiku-4.5`. Это фильтр самого Cursor, не windbu.
+Используй алиасы без слова "claude": `sonnet-4.6`, `opus-4.6`, `haiku-4.5`, `opus-4.7-max`. Это фильтр Cursor, не windbu.
 
 **Токен добавился, но `model_not_entitled`**
 Free-аккаунт Windsurf даёт ограниченный список (в основном `gemini-2.5-flash`, `glm-4.7`). Для Claude/GPT нужен Pro-тариф.
 
 **Процесс зомби после kill**
-```powershell
-.\scripts\stop.ps1
-```
-делает `taskkill /T /F` — сносит LS children вместе с основным процессом.
+`.\scripts\stop.ps1` делает `taskkill /T /F` — сносит LS children вместе с основным процессом. Или используй `windbu stop`.
+
+**Непонятно что происходит**
+`windbu doctor` — проверит node, порт, data dir, LS binary. `windbu --help` — справка.
 
 ---
 
-## Лицензия
+## 🧬 Архитектура
 
-MIT. См. [LICENSE](LICENSE) и [CREDITS.md](CREDITS.md).
+```
+┌─────────────────┐
+│   Your CLI      │  (Claude Code, Cursor, Cline, OpenCode...)
+│   Tool          │
+└────────┬────────┘
+         │ http://127.0.0.1:20129/v1
+         ▼
+┌─────────────────────────────────────────────┐
+│          windbu (local gateway)             │
+│  • format translation (OpenAI ↔ Anthropic)  │
+│  • multi-account pool (round-robin + RPM)   │
+│  • per-account proxy (HTTP/SOCKS5)          │
+│  • cascade conversation reuse (experimental)│
+│  • SSRF-safe image fetch                    │
+│  • cascade + rate-limit state persistence   │
+└────────┬────────────────────────────────────┘
+         │ gRPC over HTTP/2
+         ▼
+┌─────────────────────────────────────────────┐
+│       Windsurf Language Server (local)      │
+│  • StartCascade → SendUserCascadeMessage    │
+│  • GetCascadeTrajectorySteps (polling)      │
+│  • GetCascadeTrajectoryGeneratorMetadata    │
+└────────┬────────────────────────────────────┘
+         │
+         ▼ server.self-serve.windsurf.com
+```
+
+---
+
+## 🙏 Credits
+
+Навеяно [decolua/9router](https://github.com/decolua/9router) — та же идея локального gateway'а с единым API-ключом.
+
+Основано на [guanxiaol/WindsurfPoolAPI](https://github.com/guanxiaol/WindsurfPoolAPI) и [dwgx/WindsurfAPI](https://github.com/dwgx/WindsurfAPI) — исходная реверс-инженерия gRPC-протокола Cascade.
+
+Полный список в [CREDITS.md](CREDITS.md).
+
+---
+
+## 📜 Лицензия
+
+MIT. См. [LICENSE](LICENSE).

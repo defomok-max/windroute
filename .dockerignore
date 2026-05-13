@@ -1,0 +1,15 @@
+node_modules/
+.git/
+.github/
+.vscode/
+.idea/
+.serena/
+.env
+_boot.*
+_*.ps1
+tests/
+*.md
+!README.md
+!CREDITS.md
+logs/
+data/
