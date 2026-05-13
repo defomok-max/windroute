@@ -15,6 +15,13 @@ stats.json
 model-access.json
 runtime-config.json
 
+# локальные тестовые артефакты
+_boot.out
+_boot.err
+
+# tooling state
+.serena/
+
 # Windows
 Thumbs.db
 Desktop.ini

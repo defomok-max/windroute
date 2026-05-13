@@ -10,37 +10,60 @@
 
 // ─── Varint ────────────────────────────────────────────────
 
+/**
+ * Encode a varint. Accepts Number, BigInt, or a string numeric literal.
+ * Numbers above 2^53-1 MUST be passed as BigInt (request_id, token counts
+ * from ModelUsageStats, etc.) — otherwise precision is lost silently.
+ */
 export function encodeVarint(value) {
   const bytes = [];
-  let v = Number(value);
-  if (v < 0) {
-    const big = BigInt(v) & 0xFFFFFFFFFFFFFFFFn;
-    let b = big;
-    for (let i = 0; i < 10; i++) {
-      bytes.push(Number(b & 0x7Fn) | (i < 9 ? 0x80 : 0));
-      b >>= 7n;
-    }
-    return Buffer.from(bytes);
+  // Normalise to BigInt internally so we can cover the full uint64 range.
+  let big;
+  if (typeof value === 'bigint') {
+    big = value;
+  } else {
+    const n = Number(value);
+    if (!Number.isFinite(n)) throw new Error(`encodeVarint: non-finite value ${value}`);
+    big = BigInt(Math.trunc(n));
+  }
+  // Two's-complement for negatives (protobuf spec: 10-byte varint).
+  if (big < 0n) {
+    big = big & 0xFFFFFFFFFFFFFFFFn;
   }
   do {
-    let byte = v & 0x7F;
-    v >>>= 7;
-    if (v > 0) byte |= 0x80;
+    let byte = Number(big & 0x7Fn);
+    big >>= 7n;
+    if (big > 0n) byte |= 0x80;
     bytes.push(byte);
-  } while (v > 0);
+  } while (big > 0n);
   return Buffer.from(bytes);
 }
 
+/**
+ * Decode a varint. Returns { value, length } where `value` is a Number for
+ * inputs that fit in Number.MAX_SAFE_INTEGER, and a BigInt otherwise. Callers
+ * that expect small counters (enum / bool / short ids) can `Number(v.value)`
+ * without loss; callers reading uint64 token counts must handle BigInt.
+ */
 export function decodeVarint(buf, offset = 0) {
-  let result = 0, shift = 0, pos = offset;
+  let result = 0n;
+  let shift = 0n;
+  let pos = offset;
   while (pos < buf.length) {
     const byte = buf[pos++];
-    result |= (byte & 0x7F) << shift;
+    result |= BigInt(byte & 0x7F) << shift;
     if (!(byte & 0x80)) break;
-    shift += 7;
-    if (shift >= 64) throw new Error('Varint overflow');
+    shift += 7n;
+    if (shift >= 64n) throw new Error('Varint overflow');
   }
-  return { value: result >>> 0, length: pos - offset };
+  const length = pos - offset;
+  // Downcast to Number when it's safe; BigInt otherwise so we don't silently
+  // truncate token counts or large request_ids.
+  const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+  if (result <= MAX_SAFE) {
+    return { value: Number(result), length };
+  }
+  return { value: result, length };
 }
 
 // ─── Field-level writers (standalone functions) ────────────
@@ -99,8 +122,11 @@ export function parseFields(buf) {
   while (pos < buf.length) {
     const tag = decodeVarint(buf, pos);
     pos += tag.length;
-    const fieldNum = tag.value >>> 3;
-    const wireType = tag.value & 0x07;
+    // Tags and lengths always fit in uint32 in practice — coerce BigInt (rare,
+    // only on maliciously crafted input) to Number so bitwise ops work.
+    const tagNum = typeof tag.value === 'bigint' ? Number(tag.value) : tag.value;
+    const fieldNum = tagNum >>> 3;
+    const wireType = tagNum & 0x07;
 
     let value;
     switch (wireType) {
@@ -118,8 +144,9 @@ export function parseFields(buf) {
       case 2: { // length-delimited
         const len = decodeVarint(buf, pos);
         pos += len.length;
-        value = buf.subarray(pos, pos + len.value);
-        pos += len.value;
+        const lenNum = typeof len.value === 'bigint' ? Number(len.value) : len.value;
+        value = buf.subarray(pos, pos + lenNum);
+        pos += lenNum;
         break;
       }
       case 5: { // fixed32

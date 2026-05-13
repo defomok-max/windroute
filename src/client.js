@@ -10,7 +10,8 @@ import https from 'https';
 import { randomUUID } from 'crypto';
 import { existsSync, mkdirSync, writeFileSync } from 'fs';
 import { execSync } from 'child_process';
-import { log } from './config.js';
+import { join, resolve as pathResolve } from 'path';
+import { log, config } from './config.js';
 import { extractImages } from './image.js';
 import { grpcFrame, grpcUnary, grpcStream } from './grpc.js';
 import { getLsEntryByPort } from './langserver.js';
@@ -68,20 +69,35 @@ function cascadeHistoryBudget(modelUid) {
 // ── Fake workspace scaffold ────────────────────────────────
 const _seededWorkspaces = new Set();
 
+/**
+ * Build a Cascade workspace path under windbu's data dir so it exists on the
+ * actual host filesystem (Windows / Linux / macOS alike). The LS happily
+ * accepts whatever we hand it as long as the directory exists and the path
+ * is absolute. Kept inside config.workspaceDir so it's co-located with
+ * everything else windbu owns and gets wiped on reboot.
+ */
+function workspacePathFor(apiKey) {
+  const wsId = apiKey.slice(0, 8).replace(/[^a-z0-9]/gi, 'x');
+  return pathResolve(config.workspaceDir, `ws-${wsId}`);
+}
+
 function ensureWorkspaceDir(workspacePath) {
   if (_seededWorkspaces.has(workspacePath)) return;
   try {
     if (!existsSync(workspacePath)) {
       mkdirSync(workspacePath, { recursive: true });
-      writeFileSync(`${workspacePath}/package.json`, JSON.stringify({
+      writeFileSync(join(workspacePath, 'package.json'), JSON.stringify({
         name: 'workspace', version: '1.0.0', private: true,
         description: 'Development workspace',
       }, null, 2) + '\n');
-      writeFileSync(`${workspacePath}/README.md`, '# Workspace\n\nDevelopment workspace.\n');
-      writeFileSync(`${workspacePath}/.gitignore`, 'node_modules/\n.env\n');
+      writeFileSync(join(workspacePath, 'README.md'), '# Workspace\n\nDevelopment workspace.\n');
+      writeFileSync(join(workspacePath, '.gitignore'), 'node_modules/\n.env\n');
+      // git init is best-effort — if git isn't installed we still want the
+      // workspace to exist so AddTrackedWorkspace doesn't 404.
       try {
         execSync('git init -q && git add -A && git commit -q -m "init" --allow-empty', {
           cwd: workspacePath, stdio: 'ignore', timeout: 5000,
+          shell: process.platform === 'win32' ? true : '/bin/sh',
         });
       } catch {}
       log.info(`Workspace scaffold created: ${workspacePath}`);
@@ -190,9 +206,7 @@ export class WindsurfClient {
     if (lsEntry.workspaceInit) return lsEntry.workspaceInit;
 
     const sessionId = lsEntry.sessionId;
-    const wsId = this.apiKey.slice(0, 8).replace(/[^a-z0-9]/gi, 'x');
-    const workspacePath = `/home/user/projects/workspace-${wsId}`;
-    const workspaceUri = `file://${workspacePath}`;
+    const workspacePath = workspacePathFor(this.apiKey);
 
     lsEntry.workspaceInit = (async () => {
       try {
@@ -202,12 +216,12 @@ export class WindsurfClient {
       } catch (e) { log.warn(`InitializeCascadePanelState: ${e.message}`); }
       try {
         ensureWorkspaceDir(workspacePath);
-        const addWsProto = buildAddTrackedWorkspaceRequest(this.apiKey, workspacePath, sessionId);
+        const addWsProto = buildAddTrackedWorkspaceRequest(workspacePath);
         await grpcUnary(this.port, this.csrfToken,
           `${LS_SERVICE}/AddTrackedWorkspace`, grpcFrame(addWsProto), 5000);
       } catch (e) { log.warn(`AddTrackedWorkspace: ${e.message}`); }
       try {
-        const trustProto = buildUpdateWorkspaceTrustRequest(this.apiKey, workspaceUri, true, sessionId);
+        const trustProto = buildUpdateWorkspaceTrustRequest(this.apiKey, true, sessionId);
         await grpcUnary(this.port, this.csrfToken,
           `${LS_SERVICE}/UpdateWorkspaceTrust`, grpcFrame(trustProto), 5000);
       } catch (e) { log.warn(`UpdateWorkspaceTrust: ${e.message}`); }
@@ -724,11 +738,16 @@ export class WindsurfClient {
         headers: {
           'Content-Type': 'application/json',
           'Content-Length': Buffer.byteLength(postData),
+          'Accept-Encoding': 'identity',
         },
       }, (res) => {
-        let raw = '';
-        res.on('data', d => raw += d);
+        // Buffer the bytes, THEN decode. Concatenating strings on each
+        // 'data' chunk corrupts any response containing multi-byte UTF-8
+        // characters whose encoding straddles a chunk boundary.
+        const bufs = [];
+        res.on('data', d => bufs.push(d));
         res.on('end', () => {
+          const raw = Buffer.concat(bufs).toString('utf8');
           try {
             const json = JSON.parse(raw);
             if (res.statusCode >= 400) {
@@ -741,12 +760,15 @@ export class WindsurfClient {
             }
             resolve({ apiKey: json.api_key, name: json.name, apiServerUrl: json.api_server_url });
           } catch {
-            reject(new Error(`RegisterUser parse error: ${raw}`));
+            reject(new Error(`RegisterUser parse error: ${raw.slice(0, 200)}`));
           }
         });
         res.on('error', reject);
       });
       req.on('error', reject);
+      req.setTimeout(30000, () => {
+        req.destroy(new Error('RegisterUser timeout after 30s'));
+      });
       req.write(postData);
       req.end();
     });

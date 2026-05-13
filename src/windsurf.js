@@ -225,12 +225,14 @@ export function buildInitializePanelStateRequest(apiKey, sessionId, trusted = tr
 }
 
 // AddTrackedWorkspaceRequest has a single field: workspace (string, filesystem path).
-export function buildAddTrackedWorkspaceRequest(apiKey, workspacePath, sessionId) {
+// The apiKey and sessionId belong to the outer Metadata message on OTHER RPCs,
+// but this RPC doesn't carry metadata — intentionally kept out of the signature.
+export function buildAddTrackedWorkspaceRequest(workspacePath) {
   return writeStringField(1, workspacePath);
 }
 
 // UpdateWorkspaceTrustRequest { metadata=1, workspace_trusted=2 }. No path — trust is global.
-export function buildUpdateWorkspaceTrustRequest(apiKey, _ignored, trusted = true, sessionId) {
+export function buildUpdateWorkspaceTrustRequest(apiKey, trusted = true, sessionId) {
   return Buffer.concat([
     writeMessageField(1, buildMetadata(apiKey, undefined, sessionId)),
     writeBoolField(2, trusted),
@@ -542,7 +544,11 @@ export function parseGeneratorMetadata(buf) {
     const us = parseFields(usageField.value);
     const readUint = (fn) => {
       const f = getField(us, fn, 0);
-      return f ? Number(f.value) : 0;
+      if (!f) return 0;
+      // Varint decoder may return BigInt for uint64 values above 2^53.
+      // Token counts fit comfortably in Number, but coerce defensively so
+      // arithmetic below works regardless.
+      return typeof f.value === 'bigint' ? Number(f.value) : f.value;
     };
     const inT = readUint(2);
     const outT = readUint(3);
@@ -625,7 +631,8 @@ export function parseTrajectorySteps(buf) {
         const us = parseFields(usageField.value);
         const readUint = (fn) => {
           const f = getField(us, fn, 0);
-          return f ? Number(f.value) : 0;
+          if (!f) return 0;
+          return typeof f.value === 'bigint' ? Number(f.value) : f.value;
         };
         const inputTokens = readUint(2);
         const outputTokens = readUint(3);

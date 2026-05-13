@@ -4,6 +4,7 @@
  */
 
 import { config, log } from '../config.js';
+import { timingSafeEqual } from 'crypto';
 import {
   getAccountList, getAccountCount, addAccountByKey, addAccountByToken,
   removeAccount, setAccountStatus, resetAccountErrors, updateAccountLabel,
@@ -36,12 +37,30 @@ function json(res, status, body) {
   res.end(data);
 }
 
+/**
+ * Constant-time string comparison for the dashboard secret. Using `===`
+ * leaks length and first-diverging-byte position via response timing, which
+ * is exploitable by a sibling on the same host (WSL, VM, container). Pad to
+ * equal length first since timingSafeEqual throws on length mismatch.
+ */
+function constantTimeEquals(a, b) {
+  const aBuf = Buffer.from(String(a || ''), 'utf8');
+  const bBuf = Buffer.from(String(b || ''), 'utf8');
+  // Length mismatch is still observable in principle, but pad-then-compare
+  // at least denies an attacker a direct byte-by-byte oracle.
+  const len = Math.max(aBuf.length, bBuf.length, 1);
+  const aPad = Buffer.alloc(len); aBuf.copy(aPad);
+  const bPad = Buffer.alloc(len); bBuf.copy(bPad);
+  const equal = timingSafeEqual(aPad, bPad);
+  return equal && aBuf.length === bBuf.length;
+}
+
 function checkAuth(req) {
   const pw = req.headers['x-dashboard-password'] || '';
   // If dashboard password is set, use it
-  if (config.dashboardPassword) return pw === config.dashboardPassword;
+  if (config.dashboardPassword) return constantTimeEquals(pw, config.dashboardPassword);
   // Otherwise fall back to API key (if set)
-  if (config.apiKey) return pw === config.apiKey;
+  if (config.apiKey) return constantTimeEquals(pw, config.apiKey);
   // No password and no API key = open access
   return true;
 }
@@ -441,7 +460,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (subpath === '/windsurf-login' && method === 'POST') {
     try {
       const { email, password, proxy: loginProxy, autoAdd } = body;
-      if (!email || !password) return json(res, 400, { error: 'email 和 password 為必填' });
+      if (!email || !password) return json(res, 400, { error: 'email and password are required' });
 
       // Use provided proxy, or global proxy
       const proxy = loginProxy?.host ? loginProxy : getProxyConfig().global;
@@ -483,7 +502,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (subpath === '/oauth-login' && method === 'POST') {
     try {
       const { idToken, refreshToken, email, provider, autoAdd } = body;
-      if (!idToken) return json(res, 400, { error: '缺少 idToken' });
+      if (!idToken) return json(res, 400, { error: 'idToken is required' });
 
       const proxy = getProxyConfig().global;
       const { apiKey, name } = await reRegisterWithCodeium(idToken, proxy);

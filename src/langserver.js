@@ -27,6 +27,9 @@ const DEFAULT_API_URL = 'https://server.self-serve.windsurf.com';
 
 // Pool: key -> { process, port, csrfToken, proxy, startedAt, ready }
 const _pool = new Map();
+// In-flight ensureLs promises keyed on proxyKey so concurrent callers share
+// a single spawn instead of racing to allocate the same port.
+const _pending = new Map();
 let _nextPort = DEFAULT_PORT + 1;
 let _binaryPath = DEFAULT_BINARY;
 let _apiServerUrl = DEFAULT_API_URL;
@@ -54,6 +57,22 @@ function isPortInUse(port) {
   });
 }
 
+// Allocate a port that's not currently in the _pool and not currently
+// listening on localhost. Serial scan; concurrency is serialised by the
+// caller holding the _pending entry for its proxy key.
+async function allocatePort() {
+  const inUseInPool = new Set(Array.from(_pool.values()).map(e => e.port));
+  // Try up to ~100 ports starting from _nextPort so a cluster of proxies
+  // doesn't collide on the first free port after a crash.
+  for (let i = 0; i < 100; i++) {
+    const candidate = _nextPort++;
+    if (inUseInPool.has(candidate)) continue;
+    if (await isPortInUse(candidate)) continue;
+    return candidate;
+  }
+  throw new Error('allocatePort: no free port found in 100 attempts');
+}
+
 async function waitPortReady(port, timeoutMs = 20000) {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
@@ -74,27 +93,52 @@ async function waitPortReady(port, timeoutMs = 20000) {
 
 /**
  * Spawn an LS instance for the given proxy (or no-proxy default).
- * Idempotent — returns the existing entry if one is already running.
+ * Idempotent — returns the existing entry if one is already running. Concurrent
+ * calls for the same proxy share the in-flight spawn via _pending.
  */
 export async function ensureLs(proxy = null) {
   const key = proxyKey(proxy);
   const existing = _pool.get(key);
   if (existing && existing.ready) return existing;
+  const inflight = _pending.get(key);
+  if (inflight) return inflight;
 
+  const promise = _ensureLsInternal(proxy, key).finally(() => {
+    _pending.delete(key);
+  });
+  _pending.set(key, promise);
+  return promise;
+}
+
+async function _ensureLsInternal(proxy, key) {
   const isDefault = key === 'default';
-  const port = isDefault ? DEFAULT_PORT : _nextPort++;
+  let port;
 
-  // If something is already listening on the default port (e.g. leftover from
-  // a previous crashed run), adopt it rather than fight for the port.
-  if (isDefault && await isPortInUse(port)) {
-    log.info(`LS default port ${port} already in use — adopting existing instance`);
-    const entry = {
-      process: null, port, csrfToken: DEFAULT_CSRF,
-      proxy: null, startedAt: Date.now(), ready: true,
-      workspaceInit: null, sessionId: null,
-    };
-    _pool.set(key, entry);
-    return entry;
+  if (isDefault) {
+    port = DEFAULT_PORT;
+    // If something is already listening on the default port (e.g. leftover
+    // from a previous crashed run), adopt it rather than fight for the port.
+    // Verify it actually speaks gRPC/HTTP-2 first — a stale TCP listener that
+    // never upgrades would otherwise get marked ready:true and every chat
+    // request would hang on the first gRPC call.
+    if (await isPortInUse(port)) {
+      try {
+        await waitPortReady(port, 5000);
+        log.info(`LS default port ${port} already in use and speaks HTTP/2 — adopting existing instance`);
+        const entry = {
+          process: null, port, csrfToken: DEFAULT_CSRF,
+          proxy: null, startedAt: Date.now(), ready: true,
+          workspaceInit: null, sessionId: null,
+        };
+        _pool.set(key, entry);
+        return entry;
+      } catch (e) {
+        log.warn(`LS default port ${port} is taken but not HTTP/2-ready: ${e.message} — allocating a fresh port`);
+        port = await allocatePort();
+      }
+    }
+  } else {
+    port = await allocatePort();
   }
 
   const dataDir = pathResolve(DEFAULT_DATA_ROOT, key);

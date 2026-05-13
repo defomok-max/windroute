@@ -141,16 +141,28 @@ function buildUsageBody(serverUsage, messages, completionText, thinkingText = ''
   };
 }
 
-// Wait until getApiKey returns a non-null account, or until maxWaitMs expires.
-// Used when every account has momentarily exhausted its RPM budget so the
-// client is queued instead of getting a 503.
+// Wait until getApiKey returns a non-null account, or until maxWaitMs expires,
+// or until the provided AbortSignal fires. Used when every account has
+// momentarily exhausted its RPM budget so the client is queued instead of
+// getting a 503. Aborting (client disconnect) short-circuits so we don't
+// keep polling after the caller has gone away.
 async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, modelKey = null) {
   const deadline = Date.now() + maxWaitMs;
   let acct = getApiKey(tried, modelKey);
   while (!acct) {
     if (signal?.aborted) return null;
     if (Date.now() >= deadline) return null;
-    await new Promise(r => setTimeout(r, QUEUE_RETRY_MS));
+    await new Promise((resolve) => {
+      const timer = setTimeout(resolve, QUEUE_RETRY_MS);
+      // Abort the sleep immediately when the client disconnects so the outer
+      // loop can exit on the next iteration without burning the full retry
+      // interval.
+      signal?.addEventListener('abort', () => {
+        clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
+    if (signal?.aborted) return null;
     acct = getApiKey(tried, modelKey);
   }
   return acct;
@@ -161,10 +173,25 @@ export async function handleChatCompletions(body, deps = {}) {
     model: reqModel,
     messages,
     stream = false,
-    max_tokens,
     tools,
     tool_choice,
   } = body;
+
+  // NOTE on sampling parameters (temperature, top_p, top_k, max_tokens,
+  // stop, frequency_penalty, presence_penalty):
+  // Cascade's SendUserCascadeMessageRequest proto has no slot for caller-
+  // supplied sampling knobs. reasoning_effort / thinking / fast / 1m-context
+  // ARE honoured because they map to distinct modelUid variants in models.js
+  // (resolveModelWithOptions). Everything else is accepted on input for
+  // OpenAI-shape compatibility but silently ignored upstream — the model
+  // always runs with Cascade's default sampling config. Clients should not
+  // rely on those fields having any effect.
+  const unsupportedSampling = ['temperature', 'top_p', 'top_k', 'max_tokens',
+    'stop', 'frequency_penalty', 'presence_penalty', 'logit_bias'];
+  const ignored = unsupportedSampling.filter(k => body[k] != null);
+  if (ignored.length && log.debug) {
+    log.debug(`Chat: ignoring unsupported sampling params: ${ignored.join(', ')}`);
+  }
 
   const modelKey = resolveModelWithOptions(reqModel || config.defaultModel, body);
   const modelInfo = getModelInfo(modelKey);
@@ -172,6 +199,10 @@ export async function handleChatCompletions(body, deps = {}) {
   const creditMultiplier = modelInfo?.credit || 0;
   const source = body._source || 'POST /v1/chat/completions';
   const callerKey = deps.callerKey || deps.context?.callerKey || '';
+  // Non-stream path now carries the client's abort signal so we stop
+  // queue-waiting and abandon the upstream fetch the moment the HTTP
+  // client disconnects, instead of holding a pool slot for QUEUE_MAX_WAIT_MS.
+  const clientSignal = deps.signal || deps.context?.signal || null;
   const modelEnum = modelInfo?.enumValue || 0;
   const modelUid = modelInfo?.modelUid || null;
   // Models with a modelUid use the Cascade flow (StartCascade → SendUserCascadeMessage).
@@ -237,7 +268,7 @@ export async function handleChatCompletions(body, deps = {}) {
       status: 403,
       body: {
         error: {
-          message: `模型 ${displayModel} 在当前账号池中不可用（未订阅或已被封禁）`,
+          message: `Model ${displayModel} is not available on any account in the pool (not entitled or blocked)`,
           type: 'model_not_entitled',
         },
       },
@@ -250,6 +281,13 @@ export async function handleChatCompletions(body, deps = {}) {
 
   if (stream) {
     return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, source, creditMultiplier, callerKey);
+  }
+
+  // ── Early abort check ─────────────────────────────────
+  // If the client already disconnected before we got here (e.g. race with
+  // the abort listener), bail before reaching into the pool.
+  if (clientSignal?.aborted) {
+    return { status: 499, body: { error: { message: 'Client disconnected', type: 'client_closed' } } };
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -293,6 +331,10 @@ export async function handleChatCompletions(body, deps = {}) {
   // many rate-limited accounts can still fall through to a healthy one.
   const maxAttempts = Math.min(10, Math.max(3, getAccountList().filter(a => a.status === 'active').length));
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (clientSignal?.aborted) {
+      // Client went away while we were queueing; stop chewing pool slots.
+      return { status: 499, body: { error: { message: 'Client disconnected', type: 'client_closed' } } };
+    }
     let acct = null;
     if (reuseEntry && attempt === 0) {
       // First attempt pins to the account that owns the cached cascade.
@@ -303,7 +345,7 @@ export async function handleChatCompletions(body, deps = {}) {
       }
     }
     if (!acct) {
-      acct = await waitForAccount(tried, null, QUEUE_MAX_WAIT_MS, modelKey);
+      acct = await waitForAccount(tried, clientSignal, QUEUE_MAX_WAIT_MS, modelKey);
       if (!acct) break;
     }
     tried.push(acct.apiKey);
@@ -316,7 +358,11 @@ export async function handleChatCompletions(body, deps = {}) {
         const rl = await checkMessageRateLimit(acct.apiKey, px);
         if (!rl.hasCapacity) {
           log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
-          markRateLimited(acct.id, modelKey);
+          // Signature is markRateLimited(apiKey, durationMs, modelKey).
+          // Previously this passed (acct.id, modelKey) — `acct.id` never matches
+          // any pooled account's apiKey so the mark was a no-op, and the
+          // modelKey slid into the durationMs slot silently.
+          markRateLimited(acct.apiKey, 5 * 60 * 1000, modelKey);
           continue;
         }
       } catch (e) {
@@ -341,12 +387,13 @@ export async function handleChatCompletions(body, deps = {}) {
       useCascade, acct.apiKey, ckey,
       reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey } : null,
       emulateTools, toolPreamble,
-      source, creditMultiplier,
+      source, creditMultiplier, clientSignal,
     );
     if (result.status === 200) return result;
     reuseEntry = null; // don't try to reuse on the retry
     lastErr = result;
     const errType = result.body?.error?.type;
+    const errMsg = result.body?.error?.message || '';
     // Rate limit: this account is done for this model, try the next one
     if (errType === 'rate_limit_exceeded') {
       log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
@@ -357,19 +404,34 @@ export async function handleChatCompletions(body, deps = {}) {
       log.warn(`Account ${acct.email} cannot serve ${displayModel}, trying next account`);
       continue;
     }
-    break; // other errors (502, transport) — don't retry
+    // Transport-level error (ECONNRESET, stream canceled, LS crashed). LS
+    // often crashes on the first cold Cascade call; an LS auto-respawn
+    // follows from the exit handler. Remove this account from `tried` so
+    // the next attempt can pick it again on a fresh LS — transparent recovery.
+    const isTransport = /ECONNRESET|ECONNREFUSED|socket hang up|pending stream has been canceled|ENOTFOUND|EPIPE/i.test(errMsg);
+    if (isTransport && attempt < maxAttempts - 1) {
+      log.warn(`Transport error on ${acct.email}: ${errMsg.slice(0,80)} — retrying on fresh LS`);
+      // Pop this account from `tried` so the retry can re-select it. LS will
+      // auto-respawn via the exit handler in langserver.js; ensureLs() call
+      // at the top of the next loop iteration will wait for it.
+      tried.pop();
+      // Brief pause so the exit handler has time to clean _pool entry
+      await new Promise(r => setTimeout(r, 500));
+      continue;
+    }
+    break; // other errors (502, auth) — don't retry
   }
   // If all accounts exhausted, check if it's because they're all rate-limited
   if (!lastErr || lastErr.status === 429) {
     const rl = isAllRateLimited(modelKey);
     if (rl.allLimited) {
-      return { status: 429, body: { error: { message: `${displayModel} 所有账号均已达速率限制，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs } } };
+      return { status: 429, body: { error: { message: `All accounts rate-limited for ${displayModel}, retry in ${Math.ceil(rl.retryAfterMs / 1000)}s`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs } } };
     }
   }
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, source = 'POST /v1/chat/completions', creditMultiplier = 0, clientSignal = null) {
   const startTime = Date.now();
   try {
     let allText = '';
@@ -382,7 +444,11 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     let serverUsage = null;
 
     if (useCascade) {
-      const chunks = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, { reuseEntry: poolCtx?.reuseEntry || null, toolPreamble });
+      const chunks = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, {
+        reuseEntry: poolCtx?.reuseEntry || null,
+        toolPreamble,
+        signal: clientSignal,
+      });
       for (const c of chunks) {
         if (c.text) allText += c.text;
         if (c.thinking) allThinking += c.thinking;
@@ -515,7 +581,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       const rl = isAllRateLimited(modelKey);
       return {
         status: 429,
-        body: { error: { message: `${model} 已达速率限制，请稍后重试`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs || 60000 } },
+        body: { error: { message: `${model} rate limit reached, retry later`, type: 'rate_limit_exceeded', retry_after_ms: rl.retryAfterMs || 60000 } },
       };
     }
     return {
@@ -709,7 +775,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               const rl = await checkMessageRateLimit(acct.apiKey, px);
               if (!rl.hasCapacity) {
                 log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
-                markRateLimited(acct.id, modelKey);
+                // See non-stream path comment: signature is (apiKey, durationMs, modelKey).
+                markRateLimited(acct.apiKey, 5 * 60 * 1000, modelKey);
                 continue;
               }
             } catch (e) {
@@ -842,7 +909,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           // Check if failure is due to all accounts being rate-limited
           const rl = isAllRateLimited(modelKey);
           const errMsg = rl.allLimited
-            ? `${model} 所有账号均已达速率限制，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后重试`
+            ? `All accounts rate-limited for ${model}, retry in ${Math.ceil(rl.retryAfterMs / 1000)}s`
             : sanitizeText(lastErr?.message || 'no accounts');
           send({ id, object: 'chat.completion.chunk', created, model,
             choices: [{ index: 0, delta: { content: `\n[Error: ${errMsg}]` }, finish_reason: 'stop' }] });

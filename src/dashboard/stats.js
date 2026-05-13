@@ -150,6 +150,19 @@ function scheduleSave() {
   }, 5000);
 }
 
+/**
+ * Force an immediate flush to disk, bypassing the 5-second debounce.
+ * Used by the shutdown handler so the last few requests before SIGTERM
+ * aren't lost to the pending timer.
+ */
+export function flushStatsSync() {
+  clearTimeout(_saveTimer);
+  _saveTimer = null;
+  try {
+    atomicWrite(STATS_FILE, JSON.stringify(_state, null, 2));
+  } catch {}
+}
+
 loadFromDisk();
 
 // ─── Helpers ──────────────────────────────────────────────────

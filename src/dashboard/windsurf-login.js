@@ -5,6 +5,7 @@
 
 import http from 'http';
 import https from 'https';
+import { gunzipSync, inflateSync, brotliDecompressSync } from 'zlib';
 import { log } from '../config.js';
 
 const FIREBASE_API_KEY = 'AIzaSyDsOl-1XpT5err0Tcnx8FFod1H8gVGIycY';
@@ -118,11 +119,23 @@ function httpsRequest(url, opts, postData, proxy) {
       const bufs = [];
       res.on('data', d => bufs.push(d));
       res.on('end', () => {
-        const raw = Buffer.concat(bufs).toString('utf8');
+        let raw = Buffer.concat(bufs);
+        // Decompress if upstream (or an intermediate proxy) decided to wrap
+        // the response body. Our request explicitly sends Accept-Encoding:
+        // identity, but middleboxes don't always honour that.
+        const enc = String(res.headers['content-encoding'] || '').toLowerCase();
         try {
-          resolve({ status: res.statusCode, data: JSON.parse(raw) });
+          if (enc === 'gzip') raw = gunzipSync(raw);
+          else if (enc === 'deflate') raw = inflateSync(raw);
+          else if (enc === 'br') raw = brotliDecompressSync(raw);
+        } catch (e) {
+          return reject(new Error(`Decompress failed (encoding=${enc}): ${e.message}`));
+        }
+        const text = raw.toString('utf8');
+        try {
+          resolve({ status: res.statusCode, data: JSON.parse(text) });
         } catch {
-          reject(new Error(`Parse error (status ${res.statusCode}, encoding ${res.headers['content-encoding'] || 'identity'}): ${raw.slice(0, 200)}`));
+          reject(new Error(`Parse error (status ${res.statusCode}, encoding ${enc || 'identity'}): ${text.slice(0, 200)}`));
         }
       });
       res.on('error', reject);
@@ -180,18 +193,18 @@ export async function windsurfLogin(email, password, proxy = null) {
   if (fbRes.data.error) {
     const msg = fbRes.data.error.message || 'Unknown Firebase error';
     const friendly = {
-      'EMAIL_NOT_FOUND': '信箱不存在',
-      'INVALID_PASSWORD': '密碼錯誤',
-      'INVALID_LOGIN_CREDENTIALS': '信箱或密碼錯誤',
-      'USER_DISABLED': '帳號已被停用',
-      'TOO_MANY_ATTEMPTS_TRY_LATER': '嘗試太多次，請稍後再試',
-      'INVALID_EMAIL': '信箱格式錯誤',
+      'EMAIL_NOT_FOUND': 'Email not found',
+      'INVALID_PASSWORD': 'Invalid password',
+      'INVALID_LOGIN_CREDENTIALS': 'Invalid email or password',
+      'USER_DISABLED': 'Account disabled',
+      'TOO_MANY_ATTEMPTS_TRY_LATER': 'Too many attempts, try again later',
+      'INVALID_EMAIL': 'Invalid email format',
     }[msg] || msg;
-    throw new Error(`Firebase 登入失敗: ${friendly}`);
+    throw new Error(`Firebase login failed: ${friendly}`);
   }
 
   const idToken = fbRes.data.idToken;
-  if (!idToken) throw new Error('Firebase 回應缺少 idToken');
+  if (!idToken) throw new Error('Firebase response missing idToken');
 
   log.info(`Firebase login OK: ${email}, UID=${fbRes.data.localId}`);
 
@@ -206,7 +219,7 @@ export async function windsurfLogin(email, password, proxy = null) {
   const regRes = await httpsRequest(CODEIUM_REGISTER_URL, { method: 'POST', headers: regHeaders }, regBody, proxy);
 
   if (regRes.status >= 400 || !regRes.data.api_key) {
-    throw new Error(`Codeium 註冊失敗: ${JSON.stringify(regRes.data).slice(0, 200)}`);
+    throw new Error(`Codeium registration failed: ${JSON.stringify(regRes.data).slice(0, 200)}`);
   }
 
   log.info(`Codeium register OK: ${email} → key=${regRes.data.api_key.slice(0, 12)}...`);

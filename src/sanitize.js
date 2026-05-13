@@ -3,13 +3,11 @@
  * the API caller.
  *
  * Background: Cascade's baked-in system context tells the model its workspace
- * lives at /tmp/windsurf-workspace. Even after we removed CascadeToolConfig
- * .run_command (see windsurf.js buildCascadeConfig) the model still
- *   (a) narrates "I'll look at /tmp/windsurf-workspace/config.yaml" in plain
- *       text, and
- *   (b) occasionally emits built-in edit_file / view_file / list_directory
- *       trajectory steps whose argumentsJson references these paths.
- * Both routes leak the proxy's internal filesystem layout to API callers.
+ * lives under a specific directory. Even after we disabled the tool-running
+ * planner modes the model still narrates "I'll look at <path>/config.yaml" in
+ * plain text. Also, built-in Cascade trajectory steps (edit_file / view_file /
+ * list_directory) reference those paths in their argumentsJson. Both routes
+ * leak the proxy's internal filesystem layout to API callers.
  *
  * This module provides two scrubbers:
  *   - sanitizeText(s)        — one-shot, use on accumulated buffers
@@ -21,14 +19,41 @@
  * boundary.
  */
 
+import { config } from './config.js';
+
 // Detect the actual project root from this module's path so the sanitizer
 // covers deployments outside /root/WindsurfAPI.
 const _repoRoot = (() => {
   try {
     const thisFile = new URL(import.meta.url).pathname;
-    return thisFile.replace(/\/src\/sanitize\.js$/, '');
+    // On Windows pathname looks like "/C:/foo/bar/src/sanitize.js"; drop the
+    // leading slash so regexes match the natural drive-letter form.
+    const cleaned = process.platform === 'win32' && /^\/[A-Za-z]:\//.test(thisFile)
+      ? thisFile.slice(1)
+      : thisFile;
+    return cleaned.replace(/[\\/]src[\\/]sanitize\.js$/, '');
   } catch { return '/root/WindsurfPoolAPI'; }
 })();
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Build the list of path prefixes to scrub. Kept as literals so we can also
+// check them in PathSanitizeStream's cut-point logic below.
+const SENSITIVE_LITERALS = [
+  '/tmp/windsurf-workspace',
+  '/home/user/projects/workspace-',
+  '/opt/windsurf',
+  '/root/WindsurfPoolAPI',
+];
+if (_repoRoot.length > 10 && !SENSITIVE_LITERALS.includes(_repoRoot)) {
+  SENSITIVE_LITERALS.push(_repoRoot);
+}
+// windbu's runtime workspace dir (host-absolute path; on Windows this is
+// typically "C:\Users\<user>\.windbu\workspace"). Include it so the model
+// can't leak the real filesystem location.
+if (config?.workspaceDir) SENSITIVE_LITERALS.push(config.workspaceDir);
 
 const PATTERNS = [
   [/\/tmp\/windsurf-workspace(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
@@ -37,24 +62,16 @@ const PATTERNS = [
   // Read/Glob against a path that doesn't exist on the user's machine (#38).
   [/\/home\/user\/projects\/workspace-[a-z0-9]+(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
   [/\/opt\/windsurf(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
+  [/\/root\/WindsurfPoolAPI(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
 ];
 // Dynamic repo-root pattern — only when the path is long enough to avoid
 // overly-broad matches (e.g. root "/" or "/tmp").
 if (_repoRoot.length > 10 && _repoRoot !== '/root/WindsurfPoolAPI') {
-  PATTERNS.push([new RegExp(_repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:\\/[^\\s"\'`<>)}\\],*;]*)?', 'g'), '[internal]']);
+  PATTERNS.push([new RegExp(escapeRegex(_repoRoot) + '(?:[\\\\/][^\\s"\'`<>)}\\],*;]*)?', 'g'), '[internal]']);
 }
-// /root/WindsurfPoolAPI is always redacted regardless of auto-detection
-PATTERNS.push([/\/root\/WindsurfPoolAPI(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]']);
-
-// Bare literals (no path tail) used by the streaming cut-point finder.
-const SENSITIVE_LITERALS = [
-  '/tmp/windsurf-workspace',
-  '/home/user/projects/workspace-',
-  '/opt/windsurf',
-  '/root/WindsurfPoolAPI',
-];
-if (_repoRoot.length > 10 && _repoRoot !== '/root/WindsurfPoolAPI') {
-  SENSITIVE_LITERALS.push(_repoRoot);
+// Runtime workspace dir — matches both forward and backward separators.
+if (config?.workspaceDir) {
+  PATTERNS.push([new RegExp(escapeRegex(config.workspaceDir) + '(?:[\\\\/][^\\s"\'`<>)}\\],*;]*)?', 'g'), '[workspace]']);
 }
 
 // Character class that counts as part of a path body. Mirrors the PATTERNS

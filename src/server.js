@@ -31,9 +31,23 @@ import { BRAND, VERSION } from './version.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function readBody(req) {
+  // Cap body size to protect against memory exhaustion attacks. 25 MB is
+  // generous enough for big multimodal messages (images are base64, ~1.33×
+  // the binary size) without letting an attacker tip over the process by
+  // sending GB of garbage.
+  const MAX_BODY = 25 * 1024 * 1024;
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', c => chunks.push(c));
+    let size = 0;
+    req.on('data', c => {
+      size += c.length;
+      if (size > MAX_BODY) {
+        reject(new Error(`Request body exceeds ${MAX_BODY} bytes`));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
     req.on('error', reject);
   });
@@ -64,7 +78,27 @@ async function route(req, res) {
   const { method } = req;
   const path = req.url.split('?')[0];
 
-  if (method === 'OPTIONS') return json(res, 204, '');
+  // Per-request abort controller. Fires when the client disconnects so the
+  // handler can stop its work (cancel upstream calls, release pool slots,
+  // skip the response write). AbortController is created up-front so every
+  // code path has access to its signal, including non-stream handlers that
+  // previously leaked slots for the full timeout after client disconnect.
+  const abortController = new AbortController();
+  const onClientClose = () => {
+    if (!res.writableEnded) abortController.abort();
+  };
+  req.on('close', onClientClose);
+  res.on('close', onClientClose);
+
+  if (method === 'OPTIONS') {
+    // HTTP spec: 204 No Content must have no body. Send CORS headers only.
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta',
+    });
+    return res.end();
+  }
   if (path === '/health') {
     const counts = getAccountCount();
     return json(res, 200, {
@@ -205,7 +239,7 @@ async function route(req, res) {
     }
 
     body._source = 'POST /v1/chat/completions';
-    const result = await handleChatCompletions(body, { callerKey });
+    const result = await handleChatCompletions(body, { callerKey, signal: abortController.signal });
     if (result.stream) {
       // Streaming tuning: keep the socket hot and unblock the first byte.
       //   setNoDelay — disable Nagle so small SSE deltas aren't coalesced (40ms win)
@@ -235,7 +269,7 @@ async function route(req, res) {
     try { body = JSON.parse(await readBody(req)); } catch {
       return json(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request' } });
     }
-    const result = await handleResponses(body, { context: { callerKey } });
+    const result = await handleResponses(body, { context: { callerKey, signal: abortController.signal } });
     if (result.stream) {
       req.socket?.setKeepAlive(true);
       req.setTimeout(0);
@@ -262,7 +296,7 @@ async function route(req, res) {
     if (!Array.isArray(body.messages) || body.messages.length === 0) {
       return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages must be a non-empty array' } });
     }
-    const result = await handleMessages(body, { callerKey });
+    const result = await handleMessages(body, { callerKey, signal: abortController.signal });
     if (result.stream) {
       // Same streaming tuning as /v1/chat/completions — see comment above.
       req.socket?.setKeepAlive(true);

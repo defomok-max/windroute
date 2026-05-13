@@ -17,6 +17,7 @@
 
 import http from 'http';
 import https from 'https';
+import { gunzipSync, inflateSync, brotliDecompressSync } from 'zlib';
 import { log } from './config.js';
 
 const SERVER_HOSTS = [
@@ -81,7 +82,17 @@ function postJson(host, path, body, proxy) {
       const bufs = [];
       res.on('data', d => bufs.push(d));
       res.on('end', () => {
-        const raw = Buffer.concat(bufs).toString('utf8');
+        let body = Buffer.concat(bufs);
+        const enc = String(res.headers['content-encoding'] || '').toLowerCase();
+        try {
+          if (enc === 'gzip') body = gunzipSync(body);
+          else if (enc === 'deflate') body = inflateSync(body);
+          else if (enc === 'br') body = brotliDecompressSync(body);
+        } catch (e) {
+          reject(new Error(`Decompress failed (encoding=${enc}): ${e.message}`));
+          return;
+        }
+        const raw = body.toString('utf8');
         try {
           const parsed = raw ? JSON.parse(raw) : {};
           resolve({ status: res.statusCode, data: parsed, raw });

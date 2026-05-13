@@ -19,6 +19,10 @@ const _stats = { hits: 0, misses: 0, stores: 0, evictions: 0 };
 
 function normalize(body) {
   // Only the semantically meaningful fields — ignore stream flag, user id, etc.
+  // IMPORTANT: include every field that changes the upstream request. Missing
+  // any of these would cause a different request to collide with this one's
+  // cached response — e.g. reasoning_effort='low' returning a reply made with
+  // 'max', which costs 4x the credits.
   return {
     model: body.model || '',
     messages: body.messages || [],
@@ -27,6 +31,20 @@ function normalize(body) {
     temperature: body.temperature ?? null,
     top_p: body.top_p ?? null,
     max_tokens: body.max_tokens ?? null,
+    reasoning_effort: body.reasoning_effort
+      ?? body.effort
+      ?? body.reasoning?.effort
+      ?? body.output_config?.effort
+      ?? body.thinking?.effort
+      ?? null,
+    fast: body.fast === true
+      || body.priority === true
+      || body.output_config?.fast === true
+      || body.output_config?.priority === true
+      || body.service_tier === 'priority'
+      || body.service_tier === 'fast'
+      || false,
+    stop: body.stop ?? null,
   };
 }
 
@@ -51,8 +69,9 @@ export function cacheGet(key) {
 }
 
 export function cacheSet(key, value) {
-  // Don't cache empty or partial results
-  if (!value || (!value.text && !(value.chunks && value.chunks.length))) return;
+  // Don't cache empty or partial results. The only shape we ever store is
+  // { text, thinking } — see handlers/chat.js cacheSet callers.
+  if (!value || (!value.text && !value.thinking)) return;
   _store.set(key, { value, expiresAt: Date.now() + TTL_MS });
   _stats.stores++;
   while (_store.size > MAX_ENTRIES) {

@@ -124,16 +124,20 @@ export function checkout(fingerprint, callerKey = '') {
   if (!fingerprint) { stats.misses++; return null; }
   const entry = _pool.get(fingerprint);
   if (!entry) { stats.misses++; return null; }
-  _pool.delete(fingerprint);
+  // Validate ownership BEFORE removing the entry — otherwise a request that
+  // collides on fingerprint with a different caller would evict the owner's
+  // resumable cascade permanently.
   if (entry.callerKey && callerKey && entry.callerKey !== callerKey) {
     stats.misses++;
     return null;
   }
   if (Date.now() - entry.lastAccess > POOL_TTL_MS) {
+    _pool.delete(fingerprint);
     stats.expired++;
     stats.misses++;
     return null;
   }
+  _pool.delete(fingerprint);
   stats.hits++;
   return entry;
 }

@@ -77,14 +77,29 @@ if ($lsPath) {
 } else {
   Write-Warn2 'Windsurf Language Server not found in standard locations.'
   Write-Host ''
-  Write-Host '   You need language_server_windows_x64.exe from an installed Windsurf.'
   Write-Host '   Options:'
-  Write-Host '     [1] Enter path manually'
-  Write-Host '     [2] Skip for now (dashboard will work, chat will not)'
-  Write-Host '     [3] Cancel install'
-  $choice = Read-Host '   Choose [1/2/3]'
+  Write-Host '     [1] Download automatically (~170 MB, recommended)'
+  Write-Host '     [2] Enter path to an existing language_server_windows_x64.exe'
+  Write-Host '     [3] Skip for now (dashboard will work, chat will not)'
+  Write-Host '     [4] Cancel install'
+  $choice = Read-Host '   Choose [1/2/3/4]'
   switch ($choice) {
     '1' {
+      try {
+        $lsPath = & (Join-Path $PSScriptRoot 'download-ls.ps1') 2>&1 |
+          Where-Object { $_ -is [string] -and $_ -match '\.exe$' } |
+          Select-Object -Last 1
+        if (-not $lsPath -or -not (Test-Path -LiteralPath $lsPath)) {
+          Write-Fail 'Auto-download failed. Run scripts\download-ls.ps1 -Force and check the error.'
+          exit 1
+        }
+        Write-Ok "Downloaded: $lsPath"
+      } catch {
+        Write-Fail "Auto-download failed: $_"
+        exit 1
+      }
+    }
+    '2' {
       $manual = Read-Host '   Full path to language_server_windows_x64.exe'
       $manual = $manual.Trim('"', "'")
       if (Test-Path -LiteralPath $manual -PathType Leaf) {
@@ -95,7 +110,7 @@ if ($lsPath) {
         exit 1
       }
     }
-    '2' {
+    '3' {
       Write-Warn2 'Skipping LS. Set LS_BINARY_PATH in .env later.'
       $lsPath = ''
     }
@@ -212,6 +227,55 @@ if ($healthy) {
 # ── 7. Browser ────────────────────────────────────────────────
 if (-not $NoBrowser -and $healthy) {
   Start-Process "http://127.0.0.1:$port/dashboard" | Out-Null
+}
+
+# ── 8. First-token prompt + live verify ───────────────────────
+if ($healthy) {
+  Write-Host ''
+  Write-Step 'Add your first Windsurf token (optional — skip with empty input)'
+  Write-Host '   Get a token here:  https://windsurf.com/editor/show-auth-token'
+  Write-Host '   (it starts with "ott$" or is a long JWT)'
+  Write-Host ''
+  $token = Read-Host '   Paste token'
+  if ($token -and $token.Trim().Length -gt 20) {
+    $token = $token.Trim()
+    try {
+      $body = @{ token = $token } | ConvertTo-Json -Compress
+      $hdrs = @{ 'Content-Type' = 'application/json' }
+      $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$port/auth/login" -Method Post -Headers $hdrs -Body $body -TimeoutSec 30
+      if ($resp.success) {
+        Write-Ok "Account added: $($resp.account.email) (id=$($resp.account.id))"
+
+        # Live verify — send a real tiny chat request to confirm end-to-end path works.
+        Write-Step 'Verifying end-to-end (sending a real test chat)'
+        try {
+          $chatBody = @{
+            model = 'gemini-2.5-flash'
+            messages = @(@{ role = 'user'; content = 'Reply with exactly: ok' })
+            stream = $false
+            max_tokens = 8
+          } | ConvertTo-Json -Depth 5 -Compress
+          $chatHdrs = @{
+            'Authorization' = "Bearer $apiKey"
+            'Content-Type' = 'application/json'
+          }
+          $chat = Invoke-RestMethod -Uri "http://127.0.0.1:$port/v1/chat/completions" -Method Post -Headers $chatHdrs -Body $chatBody -TimeoutSec 45
+          $content = $chat.choices[0].message.content
+          Write-Ok "Chat works. Model replied: '$($content.Trim())'"
+        } catch {
+          Write-Warn2 "Account added, but test chat failed: $($_.Exception.Message)"
+          Write-Warn2 'This usually means the token is free-tier only. Try gemini-2.5-flash or upgrade to Pro.'
+        }
+      } else {
+        Write-Warn2 "Token not accepted. You can add it later via the dashboard."
+      }
+    } catch {
+      Write-Warn2 "Token registration failed: $($_.Exception.Message)"
+      Write-Warn2 'Add it later via dashboard (Accounts -> Add) or scripts\add-account.ps1'
+    }
+  } else {
+    Write-Host '   Skipped. Add tokens later via dashboard or scripts\add-account.ps1' -ForegroundColor DarkGray
+  }
 }
 
 Write-Host ''

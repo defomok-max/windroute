@@ -107,13 +107,11 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
 
     const client = getSession(port);
     const chunks = [];
-    let timer;
 
-    timer = setTimeout(() => {
-      try { req.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
-      done(reject, new Error('gRPC unary timeout'));
-    }, timeout);
-
+    // Order matters: construct the request BEFORE the timeout so the timer
+    // callback can reference `req` without a TDZ risk. The timer only fires
+    // on the next tick at the earliest, but future refactors that move work
+    // between these two blocks would otherwise break silently.
     const req = client.request({
       ':method': 'POST',
       ':path': path,
@@ -122,6 +120,11 @@ export function grpcUnary(port, csrfToken, path, body, timeout = 30000) {
       'user-agent': 'grpc-node/1.108.2',
       'x-codeium-csrf-token': csrfToken,
     });
+
+    const timer = setTimeout(() => {
+      try { req.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
+      done(reject, new Error('gRPC unary timeout'));
+    }, timeout);
 
     req.on('data', (chunk) => chunks.push(chunk));
 
@@ -170,16 +173,10 @@ export function grpcStream(port, csrfToken, path, body, opts = {}) {
 
   let settled = false;
   const client = getSession(port);
-  let timer;
   let pendingBuf = Buffer.alloc(0);
 
-  timer = setTimeout(() => {
-    if (settled) return;
-    settled = true;
-    try { req.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
-    onError?.(new Error('gRPC stream timeout'));
-  }, timeout);
-
+  // Construct the stream request BEFORE wiring the timeout, same reasoning
+  // as grpcUnary above.
   const req = client.request({
     ':method': 'POST',
     ':path': path,
@@ -189,6 +186,13 @@ export function grpcStream(port, csrfToken, path, body, opts = {}) {
     'user-agent': 'grpc-node/1.108.2',
     'x-codeium-csrf-token': csrfToken,
   });
+
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    try { req.close?.(http2.constants.NGHTTP2_CANCEL); } catch {}
+    onError?.(new Error('gRPC stream timeout'));
+  }, timeout);
 
   req.on('data', (chunk) => {
     if (settled) return;

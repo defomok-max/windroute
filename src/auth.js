@@ -8,13 +8,14 @@
  *   - Token-based registration via api.codeium.com
  */
 
-import { randomUUID } from 'crypto';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { randomUUID, timingSafeEqual } from 'crypto';
+import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync } from 'fs';
 import { config, log } from './config.js';
 import { getEffectiveProxy } from './dashboard/proxy-config.js';
 import { getTierModels } from './models.js';
 
 const ACCOUNTS_FILE = config.accountsFile;
+const ACCOUNTS_BACKUP = `${config.accountsFile}.bak`;
 
 // ─── Account pool ──────────────────────────────────────────
 
@@ -50,19 +51,53 @@ function saveAccounts() {
       credits: a.credits || null,
       blockedModels: a.blockedModels || [],
       refreshToken: a.refreshToken || '',
+      // Persist rate-limit state so a restart doesn't reset an active
+      // 5-minute quota block to "fresh and ready to retry immediately".
+      rateLimitedUntil: a.rateLimitedUntil || 0,
+      modelRateLimits: a._modelRateLimits || {},
     }));
-    writeFileSync(ACCOUNTS_FILE, JSON.stringify(data, null, 2));
+    // Atomic write via tmp+rename with a rolling .bak so a crash mid-write
+    // or corrupted JSON never wipes the pool. Recovery: copy .bak to .json.
+    const tmp = `${ACCOUNTS_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(data, null, 2));
+    if (existsSync(ACCOUNTS_FILE)) {
+      try { copyFileSync(ACCOUNTS_FILE, ACCOUNTS_BACKUP); } catch {}
+    }
+    renameSync(tmp, ACCOUNTS_FILE);
   } catch (e) {
     log.error('Failed to save accounts:', e.message);
   }
 }
 
 function loadAccounts() {
+  const tryLoad = (path) => {
+    if (!existsSync(path)) return null;
+    try {
+      return JSON.parse(readFileSync(path, 'utf-8'));
+    } catch (e) {
+      log.warn(`accounts file corrupt at ${path}: ${e.message}`);
+      return null;
+    }
+  };
+  let data = tryLoad(ACCOUNTS_FILE);
+  if (!data) {
+    data = tryLoad(ACCOUNTS_BACKUP);
+    if (data) log.warn(`Recovered accounts from backup: ${ACCOUNTS_BACKUP}`);
+  }
+  if (!Array.isArray(data)) return;
   try {
-    if (!existsSync(ACCOUNTS_FILE)) return;
-    const data = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf-8'));
+    const now = Date.now();
     for (const a of data) {
       if (accounts.find(x => x.apiKey === a.apiKey)) continue;
+      // Only restore rate-limit state if still in the future; otherwise a
+      // long-stopped server would resume with a stale block active.
+      const rateLimitedUntil = (a.rateLimitedUntil && a.rateLimitedUntil > now) ? a.rateLimitedUntil : 0;
+      const modelRateLimits = {};
+      if (a.modelRateLimits && typeof a.modelRateLimits === 'object') {
+        for (const [k, v] of Object.entries(a.modelRateLimits)) {
+          if (typeof v === 'number' && v > now) modelRateLimits[k] = v;
+        }
+      }
       accounts.push({
         id: a.id || randomUUID().slice(0, 8),
         email: a.email, apiKey: a.apiKey,
@@ -77,6 +112,8 @@ function loadAccounts() {
         lastProbed: a.lastProbed || 0,
         credits: a.credits || null,
         blockedModels: Array.isArray(a.blockedModels) ? a.blockedModels : [],
+        rateLimitedUntil,
+        _modelRateLimits: modelRateLimits,
       });
     }
     if (data.length > 0) log.info(`Loaded ${data.length} account(s) from disk`);
@@ -274,9 +311,16 @@ export function getAvailableModelsForAccount(account) {
 }
 
 /**
- * Set account status (active, disabled, error).
+ * Set account status (active, disabled, error, expired).
+ * Rejects unknown values so a typo or tampered API call can't silently
+ * remove an account from the pool.
  */
+const VALID_STATUSES = new Set(['active', 'disabled', 'error', 'expired']);
 export function setAccountStatus(id, status) {
+  if (!VALID_STATUSES.has(status)) {
+    log.warn(`setAccountStatus: rejecting unknown status "${status}" for account ${id}`);
+    return false;
+  }
   const account = accounts.find(a => a.id === id);
   if (!account) return false;
   account.status = status;
@@ -751,7 +795,18 @@ export function getAccountCount() {
 
 export function validateApiKey(key) {
   if (!config.apiKey) return true;
-  return key === config.apiKey;
+  // Constant-time compare to deny byte-by-byte timing oracles on the
+  // /v1/* endpoints. timingSafeEqual requires equal-length buffers, so
+  // pad first and separately confirm length parity.
+  const a = Buffer.from(String(key || ''), 'utf8');
+  const b = Buffer.from(config.apiKey, 'utf8');
+  if (a.length !== b.length) {
+    // Still compare against a zeroed buffer of the right size so a wrong
+    // length doesn't return faster than a wrong-byte mismatch.
+    try { timingSafeEqual(b, Buffer.alloc(b.length)); } catch {}
+    return false;
+  }
+  return timingSafeEqual(a, b);
 }
 
 // ─── Firebase token refresh ──────────────────────────────────

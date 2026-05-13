@@ -434,7 +434,6 @@ export function getModelKeysByEnum(enumValue) {
 
 // ─── Tier access ───────────────────────────────────────────
 
-const ALL_MODEL_KEYS = Object.keys(MODELS);
 const FREE_TIER_MODELS = ['gpt-4o-mini', 'gemini-2.5-flash'];
 
 export const MODEL_TIER_ACCESS = {

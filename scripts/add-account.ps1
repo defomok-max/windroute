@@ -19,14 +19,15 @@ if (-not (Test-Path -LiteralPath $envPath)) {
 }
 $envText = Get-Content -LiteralPath $envPath -Raw
 $port = if ($envText -match 'PORT=(\d+)') { [int]$matches[1] } else { 20129 }
-$host = if ($envText -match 'HOST=([\w\.\-]+)') { $matches[1] } else { '127.0.0.1' }
+# NOTE: $host is a PowerShell automatic variable; use a non-reserved name.
+$bindHost = if ($envText -match 'HOST=([\w\.\-]+)') { $matches[1] } else { '127.0.0.1' }
 
 $payload = @{ token = $Token }
 if ($Label) { $payload.label = $Label }
 
 try {
   $resp = Invoke-RestMethod `
-    -Uri "http://${host}:${port}/auth/login" `
+    -Uri "http://${bindHost}:${port}/auth/login" `
     -Method Post `
     -ContentType 'application/json' `
     -Body ($payload | ConvertTo-Json -Compress) `

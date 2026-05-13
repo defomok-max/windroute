@@ -16,6 +16,7 @@ import { startLanguageServer, waitForReady, stopLanguageServer } from './langser
 import { startServer } from './server.js';
 import { config, log } from './config.js';
 import { runPreflight } from './preflight.js';
+import { flushStatsSync } from './dashboard/stats.js';
 import { existsSync, mkdirSync, rmSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { BRAND, VERSION } from './version.js';
@@ -86,11 +87,13 @@ async function main() {
     if (typeof server.closeIdleConnections === 'function') server.closeIdleConnections();
     server.close(() => {
       log.info('HTTP server closed, stopping language server');
+      try { flushStatsSync(); } catch {}
       try { stopLanguageServer(); } catch {}
       process.exit(0);
     });
     setTimeout(() => {
       log.warn('Drain timeout, forcing exit');
+      try { flushStatsSync(); } catch {}
       try { stopLanguageServer(); } catch {}
       process.exit(0);
     }, 30_000);
