@@ -65,13 +65,13 @@ export function isModelAllowed(modelId) {
     const allowed = _config.list.includes(modelId);
     return allowed
       ? { allowed: true }
-      : { allowed: false, reason: `模型 ${modelId} 不在允許清單中` };
+      : { allowed: false, reason: `Model ${modelId} is not in the allowlist` };
   }
 
   if (_config.mode === 'blocklist') {
     const blocked = _config.list.includes(modelId);
     return blocked
-      ? { allowed: false, reason: `模型 ${modelId} 已被封鎖` }
+      ? { allowed: false, reason: `Model ${modelId} is blocked` }
       : { allowed: true };
   }
 

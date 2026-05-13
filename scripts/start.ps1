@@ -30,16 +30,27 @@ if (Test-Path -LiteralPath $pidFile) {
   Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
 }
 
-# Write our PID for stop.ps1 / future start.ps1 calls to find us
+# Ensure PID dir exists
 $null = New-Item -ItemType Directory -Path (Split-Path $pidFile) -Force -ErrorAction SilentlyContinue
-$PID | Out-File -LiteralPath $pidFile -Encoding ascii -Force
 
 Set-Location -LiteralPath $root
 try {
-  & node 'src\index.js'
+  # Start node via .NET Process so we get the PID immediately while keeping
+  # stdout/stderr attached to this console window.
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName = 'node'
+  $psi.Arguments = 'src\index.js'
+  $psi.WorkingDirectory = $root
+  $psi.UseShellExecute = $false
+  $nodeProc = [System.Diagnostics.Process]::Start($psi)
+  $nodeProc.Id | Out-File -LiteralPath $pidFile -Encoding ascii -Force
+  # Block until node exits (keeps this window open, shows output)
+  $nodeProc.WaitForExit()
 } finally {
   if (Test-Path -LiteralPath $pidFile) {
     $cur = Get-Content -LiteralPath $pidFile -ErrorAction SilentlyContinue
-    if ("$cur" -eq "$PID") { Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue }
+    if ($nodeProc -and "$cur" -eq "$($nodeProc.Id)") {
+      Remove-Item -LiteralPath $pidFile -Force -ErrorAction SilentlyContinue
+    }
   }
 }
