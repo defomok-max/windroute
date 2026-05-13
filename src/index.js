@@ -21,6 +21,27 @@ import { existsSync, mkdirSync, rmSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { BRAND, VERSION } from './version.js';
 
+// ── Global error handlers ─────────────────────────────────
+// Catch stray promise rejections and uncaught exceptions so the process
+// doesn't die silently (Node 15+ default). We log the error with full stack
+// and keep running — these shouldn't happen in practice, but when they do
+// the user deserves a trail in %USERPROFILE%\.windbu\logs\error-*.jsonl
+// rather than an abruptly dead server window.
+process.on('unhandledRejection', (reason, promise) => {
+  const msg = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+  log.error('Unhandled promise rejection:', msg);
+});
+process.on('uncaughtException', (err, origin) => {
+  const msg = err instanceof Error ? (err.stack || err.message) : String(err);
+  log.error(`Uncaught exception (${origin}):`, msg);
+  // Uncaught exceptions typically mean a broken invariant — exit after
+  // logging so the watchdog (start.ps1) can restart us cleanly instead of
+  // leaving the process in a half-dead state.
+  try { flushStatsSync(); } catch {}
+  try { stopLanguageServer(); } catch {}
+  process.exit(1);
+});
+
 async function main() {
   const pad = (s, n) => s + ' '.repeat(Math.max(0, n - s.length));
   const line1 = pad(`${BRAND}  v${VERSION}`, 42);

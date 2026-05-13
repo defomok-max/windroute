@@ -153,14 +153,18 @@ async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, mode
     if (signal?.aborted) return null;
     if (Date.now() >= deadline) return null;
     await new Promise((resolve) => {
-      const timer = setTimeout(resolve, QUEUE_RETRY_MS);
-      // Abort the sleep immediately when the client disconnects so the outer
-      // loop can exit on the next iteration without burning the full retry
-      // interval.
-      signal?.addEventListener('abort', () => {
+      const timer = setTimeout(() => {
+        // Remove the abort listener before resolving so we don't accumulate
+        // O(N) listeners on a long-lived signal — which would trigger Node's
+        // MaxListenersExceededWarning after ~10 queue retries.
+        signal?.removeEventListener?.('abort', onAbort);
+        resolve();
+      }, QUEUE_RETRY_MS);
+      const onAbort = () => {
         clearTimeout(timer);
         resolve();
-      }, { once: true });
+      };
+      signal?.addEventListener?.('abort', onAbort, { once: true });
     });
     if (signal?.aborted) return null;
     acct = getApiKey(tried, modelKey);

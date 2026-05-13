@@ -76,18 +76,25 @@ function json(res, status, body) {
 
 async function route(req, res) {
   const { method } = req;
-  const path = req.url.split('?')[0];
+  // Defensive URL parse. `req.url` is typed as a string, but a malformed
+  // request could conceivably set it to something unparseable; handle that
+  // without crashing the whole server.
+  let path;
+  try {
+    path = (req.url || '/').split('?')[0];
+  } catch {
+    return json(res, 400, { error: { message: 'Malformed request URL', type: 'invalid_request' } });
+  }
 
-  // Per-request abort controller. Fires when the client disconnects so the
-  // handler can stop its work (cancel upstream calls, release pool slots,
-  // skip the response write). AbortController is created up-front so every
-  // code path has access to its signal, including non-stream handlers that
-  // previously leaked slots for the full timeout after client disconnect.
+  // Per-request abort controller. Fires when the response connection is
+  // torn down before we finished writing to it (i.e. the client gave up).
+  // Only listen on res.close — req.close can fire as soon as the request
+  // body is fully read, even if the response is still in-flight, which
+  // would cause spurious aborts in the middle of the handler.
   const abortController = new AbortController();
   const onClientClose = () => {
     if (!res.writableEnded) abortController.abort();
   };
-  req.on('close', onClientClose);
   res.on('close', onClientClose);
 
   if (method === 'OPTIONS') {

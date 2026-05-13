@@ -225,10 +225,17 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   const accountPatch = subpath.match(/^\/accounts\/([^/]+)$/);
   if (accountPatch && method === 'PATCH') {
     const id = accountPatch[1];
-    if (body.status) setAccountStatus(id, body.status);
-    if (body.label) updateAccountLabel(id, body.label);
+    const errors = [];
+    if (body.status) {
+      if (!setAccountStatus(id, body.status)) errors.push(`invalid status: ${body.status}`);
+    }
+    if (body.label != null) {
+      if (typeof body.label !== 'string' || body.label.length > 200) errors.push('label must be a non-empty string ≤200 chars');
+      else updateAccountLabel(id, body.label);
+    }
     if (body.resetErrors) resetAccountErrors(id);
     if (Array.isArray(body.blockedModels)) setAccountBlockedModels(id, body.blockedModels);
+    if (errors.length) return json(res, 400, { error: errors.join('; ') });
     return json(res, 200, { success: true });
   }
 

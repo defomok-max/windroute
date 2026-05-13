@@ -102,13 +102,16 @@ curl http://127.0.0.1:20129/v1/chat/completions `
 |---|---|
 | `.\scripts\install.ps1` | Первая установка (idempotent, re-run безопасен) |
 | `.\scripts\install.ps1 -Force` | Перегенерирует `.env` с новыми ключами |
-| `.\scripts\start.ps1` | Запуск вручную |
+| `.\scripts\start.ps1` | Запуск вручную (с watchdog'ом) |
+| `.\scripts\start.ps1 -NoWatchdog` | Запуск без авто-restart'а |
 | `.\scripts\stop.ps1` | Остановка |
 | `.\scripts\add-account.ps1 -Token '...'` | Добавить токен через CLI |
 | `.\scripts\detect-ls.ps1` | Вывести путь к Language Server |
+| `.\scripts\download-ls.ps1` | Скачать LS-бинарь (~170 MB) |
 | `.\scripts\enable-autostart.ps1` | Включить автозапуск при логине |
 | `.\scripts\disable-autostart.ps1` | Выключить автозапуск |
 | `.\scripts\uninstall.ps1` | Снести автозапуск + ярлык + данные |
+| `node scripts/smoke.mjs` | Прогнать smoke-тесты (~2с, 21 проверка) |
 
 ---
 

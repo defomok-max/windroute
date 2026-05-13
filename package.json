@@ -1,16 +1,38 @@
 {
   "name": "windbu",
   "version": "1.0.0",
-  "description": "Local gateway для Windsurf AI — один OpenAI/Anthropic-совместимый endpoint поверх нескольких Windsurf-аккаунтов. Windows-only.",
+  "description": "Local gateway for Windsurf AI — one OpenAI/Anthropic-compatible endpoint over multiple Windsurf accounts. Windows-only.",
   "private": true,
   "type": "module",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "dev": "node src/index.js"
+    "dev": "node src/index.js",
+    "check": "node --check src/index.js && node --check src/server.js && node --check src/auth.js",
+    "smoke": "node scripts/smoke.mjs"
   },
   "engines": {
     "node": ">=20"
+  },
+  "keywords": [
+    "windsurf",
+    "cascade",
+    "claude",
+    "openai",
+    "anthropic",
+    "gateway",
+    "proxy",
+    "pool",
+    "claude-code",
+    "cursor"
+  ],
+  "homepage": "https://github.com/defomok-max/windroute",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/defomok-max/windroute.git"
+  },
+  "bugs": {
+    "url": "https://github.com/defomok-max/windroute/issues"
   },
   "license": "MIT"
 }
