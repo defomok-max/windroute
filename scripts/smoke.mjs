@@ -143,6 +143,28 @@ test('validateApiKey is constant-time (no throw on length mismatch)', () => {
   assert.equal(typeof r, 'boolean');
 });
 
+// ── getInternalAccountView exposes apiKey + refreshToken ──
+const { getInternalAccountView } = await import('../src/auth.js');
+test('getInternalAccountView exposes apiKey and refreshToken', () => {
+  const a = addAccountByKey('smoke-internal-key', 'smoke-internal');
+  const row = getInternalAccountView().find(x => x.id === a.id);
+  assert.ok(row, 'account should be in internal view');
+  assert.equal(row.apiKey, 'smoke-internal-key');
+  assert.equal(typeof row.refreshToken, 'string');
+  removeAccount(a.id);
+});
+
+// ── stats.recordRequest handles unknown account without throwing ──
+console.log('\n[stats]');
+const { recordRequest } = await import('../src/dashboard/stats.js');
+test('recordRequest with unmapped apiKey falls back to sha256 fingerprint', () => {
+  // Regression: stats.js used createHash without importing it. If the apiKey
+  // doesn't resolve to a known account the fallback path must still run.
+  assert.doesNotThrow(() => {
+    recordRequest({ model: 'smoke', success: true, durationMs: 1, accountId: 'totally-unknown-key' });
+  });
+});
+
 // ── Summary ──
 console.log('');
 if (failures > 0) {

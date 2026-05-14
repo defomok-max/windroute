@@ -14,28 +14,42 @@
  * detail granularity isn't available retroactively.
  */
 
-import { readFileSync, writeFileSync, renameSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, renameSync, existsSync, unlinkSync } from 'fs';
+import { createHash } from 'crypto';
 
 // Lazy-resolved reference to auth.js (avoids circular-import at parse time).
 let _getAccountList = null;
+/**
+ * Resolve an apiKey to a human-friendly label (account email/alias). Falls
+ * back to a short, non-reversible fingerprint so stats exports never expose
+ * even a prefix of the real API key.
+ */
 function resolveAccountEmail(apiKey) {
   if (!apiKey) return '';
   try {
     if (!_getAccountList) {
       // auth.js is guaranteed to be fully loaded by the time any HTTP
       // request triggers recordRequest(), so a sync property read on the
-      // already-cached module is safe.
-      _getAccountList = globalThis.__windsurf_getAccountList;
+      // already-cached module is safe. Prefer the internal view (carries
+      // apiKey) so we can resolve to the account email; fall back to
+      // whatever's on globalThis for older bootstraps.
+      _getAccountList = globalThis.__windsurf_getAccountListInternal
+        || globalThis.__windsurf_getAccountList;
     }
     if (_getAccountList) {
       const match = _getAccountList().find(a => a.apiKey === apiKey);
       if (match) return match.email;
     }
   } catch {}
-  return String(apiKey).slice(0, 16);
+  // No match — return an 8-char sha256 fingerprint prefix, not the raw key.
+  try {
+    return 'acct:' + createHash('sha256').update(String(apiKey)).digest('hex').slice(0, 8);
+  } catch {
+    return 'acct:unknown';
+  }
 }
 
-import { config as __windbuCfg } from '../config.js';
+import { config as __windbuCfg, log } from '../config.js';
 const STATS_FILE = __windbuCfg.statsFile;
 const SCHEMA_VERSION = 2;
 
@@ -72,8 +86,15 @@ function freshState() {
 
 function atomicWrite(path, data) {
   const tmp = `${path}.tmp`;
-  writeFileSync(tmp, data);
-  renameSync(tmp, path);
+  try {
+    writeFileSync(tmp, data);
+    renameSync(tmp, path);
+  } catch (e) {
+    // Clean up the partial tmp so a later successful write doesn't race
+    // with a stale file on disk.
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
+    throw e;
+  }
 }
 
 function loadFromDisk() {
@@ -137,16 +158,28 @@ function loadFromDisk() {
   } catch (e) {
     // Corrupt stats.json — start fresh, but don't crash boot
     // (original file is left on disk for forensic inspection)
+    log.warn(`stats: failed to load ${STATS_FILE} — starting fresh: ${e.message}`);
   }
 }
 
 let _saveTimer = null;
+// Suppress repeated warnings if the disk is consistently failing (e.g. full
+// volume, permission flap). One warning per minute is enough to surface the
+// issue without spamming the log.
+let _lastSaveWarnAt = 0;
+function warnSaveFailure(stage, err) {
+  const now = Date.now();
+  if (now - _lastSaveWarnAt > 60_000) {
+    _lastSaveWarnAt = now;
+    log.warn(`stats: ${stage} write to ${STATS_FILE} failed: ${err?.message || err}`);
+  }
+}
 function scheduleSave() {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(() => {
     try {
       atomicWrite(STATS_FILE, JSON.stringify(_state, null, 2));
-    } catch {}
+    } catch (e) { warnSaveFailure('async', e); }
   }, 5000);
 }
 
@@ -160,7 +193,7 @@ export function flushStatsSync() {
   _saveTimer = null;
   try {
     atomicWrite(STATS_FILE, JSON.stringify(_state, null, 2));
-  } catch {}
+  } catch (e) { warnSaveFailure('sync flush', e); }
 }
 
 loadFromDisk();

@@ -1,0 +1,30 @@
+# Normalize line endings to LF in the repo, regardless of the user's
+# core.autocrlf setting. Without this, every commit on Windows produces
+# "LF will be replaced by CRLF" warnings and noisy diffs whenever the
+# checked-out copy goes through a CR-stripping tool (e.g. some editors).
+* text=auto eol=lf
+
+# Source code — always LF
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
+*.html text eol=lf
+*.css  text eol=lf
+*.sh   text eol=lf
+
+# Windows-specific scripts — keep CRLF so PowerShell parses them reliably.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# Dockerfile — LF (gets shipped to Linux containers)
+Dockerfile text eol=lf
+
+# Binary blobs
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
+*.ico binary

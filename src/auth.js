@@ -9,7 +9,7 @@
  */
 
 import { randomUUID, timingSafeEqual } from 'crypto';
-import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, renameSync, copyFileSync, unlinkSync } from 'fs';
 import { config, log } from './config.js';
 import { getEffectiveProxy } from './dashboard/proxy-config.js';
 import { getTierModels } from './models.js';
@@ -42,6 +42,7 @@ function pruneRpmHistory(account, now) {
 }
 
 function saveAccounts() {
+  const tmp = `${ACCOUNTS_FILE}.tmp`;
   try {
     const data = accounts.map(a => ({
       id: a.id, email: a.email, apiKey: a.apiKey,
@@ -58,7 +59,6 @@ function saveAccounts() {
     }));
     // Atomic write via tmp+rename with a rolling .bak so a crash mid-write
     // or corrupted JSON never wipes the pool. Recovery: copy .bak to .json.
-    const tmp = `${ACCOUNTS_FILE}.tmp`;
     writeFileSync(tmp, JSON.stringify(data, null, 2));
     if (existsSync(ACCOUNTS_FILE)) {
       try { copyFileSync(ACCOUNTS_FILE, ACCOUNTS_BACKUP); } catch {}
@@ -66,6 +66,9 @@ function saveAccounts() {
     renameSync(tmp, ACCOUNTS_FILE);
   } catch (e) {
     log.error('Failed to save accounts:', e.message);
+    // Never leave a stale .tmp on disk — the next successful save would
+    // pass, but a crash right after a partial write would leave garbage.
+    try { if (existsSync(tmp)) unlinkSync(tmp); } catch {}
   }
 }
 
@@ -270,11 +273,59 @@ export async function addAccountByRefreshToken(refreshToken, label = '') {
 }
 
 /**
- * Add account via email/password is not supported for direct Firebase login.
- * Use token-based auth instead: get a token from windsurf.com/show-auth-token
+ * Add account via direct email/password Windsurf login.
+ *
+ * Delegates to the Firebase + Codeium register flow in dashboard/windsurf-login.
+ * On success the apiKey and refreshToken are persisted; the refreshToken
+ * enables long-lived background renewal so the account doesn't fall out of
+ * the pool when the idToken expires (~1h).
+ *
+ * @param {string} email
+ * @param {string} password
+ * @param {object} [proxy] - optional proxy { host, port, username, password, type }
+ * @returns {Promise<account>}
  */
-export async function addAccountByEmail(email, password) {
-  throw new Error('Direct email/password login is not supported. Use token-based auth: get token from windsurf.com, then POST /auth/login {"token":"..."}');
+export async function addAccountByEmail(email, password, proxy = null) {
+  const { windsurfLogin } = await import('./dashboard/windsurf-login.js');
+  const result = await windsurfLogin(email, password, proxy || getEffectiveProxy(null) || null);
+
+  const existing = accounts.find(a => a.apiKey === result.apiKey);
+  if (existing) {
+    // Persist the freshly-issued refreshToken so background renewal can use it.
+    if (result.refreshToken && result.refreshToken !== existing.refreshToken) {
+      existing.refreshToken = result.refreshToken;
+      saveAccounts();
+      log.info(`Account ${existing.id} (${existing.email}) refreshToken updated (duplicate email login)`);
+    }
+    return existing;
+  }
+
+  const account = {
+    id: randomUUID().slice(0, 8),
+    email: result.email || email,
+    apiKey: result.apiKey,
+    apiServerUrl: result.apiServerUrl || '',
+    method: 'email',
+    status: 'active',
+    lastUsed: 0,
+    errorCount: 0,
+    refreshToken: result.refreshToken || '',
+    idToken: result.idToken || '',
+    expiresAt: 0,
+    refreshTimer: null,
+    addedAt: Date.now(),
+    tier: 'unknown',
+    capabilities: {},
+    lastProbed: 0,
+    blockedModels: [],
+    credits: null,
+  };
+  accounts.push(account);
+  saveAccounts();
+  log.info(`Account added: ${account.id} (${account.email}) [email]`);
+  ensureRefreshTimer();
+  fetchAndMergeModelCatalog().catch(e => log.warn(`Auto model-catalog refresh: ${e.message}`));
+  return account;
 }
 
 /**
@@ -614,9 +665,23 @@ export function isAuthenticated() {
 }
 
 // Publish to globalThis so stats.js can resolve apiKey→email without
-// a circular import. Safe because getAccountList is a pure read function.
-globalThis.__windsurf_getAccountList = getAccountList;
+// a circular import. Provides an internal view that still carries apiKey
+// — used only within the server process (never serialised to HTTP).
+globalThis.__windsurf_getAccountListInternal = () => accounts.map(a => ({
+  id: a.id,
+  email: a.email,
+  apiKey: a.apiKey,
+}));
+// Legacy alias: keep for any code still reaching for the old name.
+globalThis.__windsurf_getAccountList = globalThis.__windsurf_getAccountListInternal;
 
+/**
+ * Public view of the account pool. Used by dashboard + /auth/accounts.
+ * Deliberately omits the raw Windsurf apiKey — exposing it here would let
+ * anyone with dashboard credentials siphon the entire token pool. Internal
+ * callers that genuinely need the key must use the accounts[] array
+ * directly (same module) or call getInternalAccountView().
+ */
 export function getAccountList() {
   const now = Date.now();
   return accounts.map(a => {
@@ -631,7 +696,6 @@ export function getAccountList() {
       lastUsed: a.lastUsed ? new Date(a.lastUsed).toISOString() : null,
       addedAt: new Date(a.addedAt).toISOString(),
       keyPrefix: a.apiKey.slice(0, 8) + '...',
-      apiKey: a.apiKey,
       tier: a.tier || 'unknown',
       capabilities: a.capabilities || {},
       lastProbed: a.lastProbed || 0,
@@ -648,6 +712,26 @@ export function getAccountList() {
       tierModels: getTierModels(a.tier || 'unknown'),
     };
   });
+}
+
+/**
+ * Internal account view — same shape as getAccountList() plus apiKey and
+ * refreshToken. Use this ONLY from server-internal code paths that must route
+ * traffic or bill against a specific key. Never send the result over HTTP.
+ */
+export function getInternalAccountView() {
+  const now = Date.now();
+  return accounts.map(a => ({
+    id: a.id,
+    email: a.email,
+    apiKey: a.apiKey,
+    refreshToken: a.refreshToken || '',
+    status: a.status,
+    tier: a.tier || 'unknown',
+    availableModels: getAvailableModelsForAccount(a),
+    rateLimited: !!(a.rateLimitedUntil && a.rateLimitedUntil > now),
+    lastProbed: a.lastProbed || 0,
+  }));
 }
 
 /**

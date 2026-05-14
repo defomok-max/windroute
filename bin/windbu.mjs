@@ -204,9 +204,12 @@ function cmdStart() {
   child.on('error', (err) => { fail(`Failed to start: ${err.message}`); process.exit(1); });
 
   // Open the browser a few seconds after boot — only on TTY + non-CI so
-  // unattended/systemd launches don't try to `xdg-open` a browser.
+  // unattended/systemd launches don't try to `xdg-open` a browser. Accept
+  // either `--no-open` on the command line or WINDBU_NO_BROWSER in the env
+  // to suppress the popup.
   const port = parseInt(env.PORT || DEFAULT_PORT, 10);
-  const shouldOpen = isTty && !process.env.CI && process.argv.includes('--open') !== false && !process.env.WINDBU_NO_BROWSER;
+  const wantsNoOpen = process.argv.includes('--no-open') || process.argv.includes('--no-browser');
+  const shouldOpen = isTty && !process.env.CI && !wantsNoOpen && !process.env.WINDBU_NO_BROWSER;
   if (shouldOpen) {
     setTimeout(() => probeHealth(port).then((ok) => {
       if (ok) openBrowser(`http://127.0.0.1:${port}/dashboard`);
@@ -239,9 +242,21 @@ async function cmdLogin(token) {
   banner();
   step(`Adding token to the pool (http://127.0.0.1:${port}/auth/login)`);
   const body = JSON.stringify({ token });
-  const res = await fetch(`http://127.0.0.1:${port}/auth/login`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body,
-  }).catch(e => { fail(`windbu isn't running on port ${port}. Start it with \`windbu\`.`); process.exit(1); });
+  // Include the gateway's own credentials so /auth/login passes the
+  // admin-auth gate added in the security audit. Prefer the API key; fall
+  // back to DASHBOARD_PASSWORD so either one works.
+  const headers = { 'Content-Type': 'application/json' };
+  if (env.API_KEY) headers['Authorization'] = `Bearer ${env.API_KEY}`;
+  if (env.DASHBOARD_PASSWORD) headers['X-Dashboard-Password'] = env.DASHBOARD_PASSWORD;
+  let res;
+  try {
+    res = await fetch(`http://127.0.0.1:${port}/auth/login`, {
+      method: 'POST', headers, body,
+    });
+  } catch (e) {
+    fail(`windbu isn't running on port ${port}. Start it with \`windbu\`.`);
+    process.exit(1);
+  }
   const data = await res.json().catch(() => ({}));
   if (res.ok && data.success) {
     ok(`Account added: ${data.account?.email} (id=${data.account?.id})`);

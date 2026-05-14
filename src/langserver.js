@@ -323,11 +323,11 @@ export function isLanguageServerRunning() {
   return _pool.size > 0;
 }
 
-export async function waitForReady(/* timeoutMs */) {
+export async function waitForReady(timeoutMs = 20000) {
   const def = _pool.get('default');
   if (!def) throw new Error('default LS not initialized');
   if (def.ready) return true;
-  await waitPortReady(def.port, 20000);
+  await waitPortReady(def.port, timeoutMs);
   def.ready = true;
   return true;
 }

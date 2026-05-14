@@ -19,6 +19,7 @@ import {
   validateApiKey, isAuthenticated, getAccountList, getAccountCount,
   addAccountByEmail, addAccountByToken, addAccountByKey, addAccountByRefreshToken, removeAccount,
 } from './auth.js';
+import { timingSafeEqual } from 'crypto';
 import { handleChatCompletions } from './handlers/chat.js';
 import { handleModels } from './handlers/models.js';
 import { handleMessages } from './handlers/messages.js';
@@ -63,13 +64,57 @@ function extractToken(req) {
   return h.startsWith('Bearer ') ? h.slice(7) : h;
 }
 
+/**
+ * Constant-time string equality for admin credentials.
+ * `timingSafeEqual` throws on length mismatch, so we pad first and then
+ * compare lengths separately so a wrong length doesn't return faster
+ * than a wrong-byte mismatch.
+ */
+function constantTimeEquals(a, b) {
+  const aBuf = Buffer.from(String(a || ''), 'utf8');
+  const bBuf = Buffer.from(String(b || ''), 'utf8');
+  const len = Math.max(aBuf.length, bBuf.length, 1);
+  const aPad = Buffer.alloc(len); aBuf.copy(aPad);
+  const bPad = Buffer.alloc(len); bBuf.copy(bPad);
+  const equal = timingSafeEqual(aPad, bPad);
+  return equal && aBuf.length === bBuf.length;
+}
+
+/**
+ * Authorise an admin-scope request (pool management, account list).
+ *
+ * Accepts either:
+ *   - `X-Dashboard-Password: <password>`  (explicit dashboard credential)
+ *   - `Authorization: Bearer <api-key>`  (the gateway API key)
+ *   - `x-api-key: <api-key>`              (Anthropic-style)
+ *
+ * When neither DASHBOARD_PASSWORD nor API_KEY is configured, the server is
+ * running in open-access mode (local dev, no secrets set) and we fall
+ * through so first-run UX still works. That is noisy but explicit —
+ * `ensureConfigured` in bin/windbu.mjs always generates both on boot, so in
+ * practice this open path only fires for hand-edited .env files.
+ */
+function isAdminAuthorised(req) {
+  const pw = req.headers['x-dashboard-password'];
+  if (config.dashboardPassword) {
+    if (pw && constantTimeEquals(pw, config.dashboardPassword)) return true;
+  }
+  const bearer = extractToken(req);
+  if (config.apiKey) {
+    if (bearer && constantTimeEquals(bearer, config.apiKey)) return true;
+  }
+  // No secrets configured at all — open access for local dev.
+  if (!config.dashboardPassword && !config.apiKey) return true;
+  return false;
+}
+
 function json(res, status, body) {
   const data = JSON.stringify(body);
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-dashboard-password, x-dashboard-session, x-session-id',
   });
   res.end(data);
 }
@@ -102,7 +147,7 @@ async function route(req, res) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, x-dashboard-password, x-dashboard-session, x-session-id',
     });
     return res.end();
   }
@@ -140,10 +185,26 @@ async function route(req, res) {
     return handleDashboardApi(method, subpath, body, req, res);
   }
 
-  // ─── Auth management (no API key required) ─────────────
+  // ─── Auth management (admin-scope: requires X-Dashboard-Password or API key) ───
 
+  // /auth/status — public counters (no secrets disclosed)
   if (path === '/auth/status') {
     return json(res, 200, { authenticated: isAuthenticated(), ...getAccountCount() });
+  }
+
+  // Everything else under /auth/* is admin-only. Exposing this to any local
+  // TCP peer would let them dump the Windsurf token pool or add their own
+  // keys to siphon free quota — see audit notes C1/C2.
+  const authPathsAdmin = path === '/auth/accounts'
+    || path.startsWith('/auth/accounts/')
+    || path === '/auth/login';
+  if (authPathsAdmin && !isAdminAuthorised(req)) {
+    return json(res, 401, {
+      error: {
+        message: 'Admin auth required: send X-Dashboard-Password header or Authorization: Bearer <API_KEY>.',
+        type: 'auth_error',
+      },
+    });
   }
 
   if (path === '/auth/accounts' && method === 'GET') {
@@ -326,6 +387,10 @@ export function startServer() {
 
   const server = http.createServer(async (req, res) => {
     activeRequests.add(res);
+    // SSE stream handlers attach additional 'close' listeners (heartbeat
+    // cleanup, abort propagation, path-sanitizer teardown). Raise the cap so
+    // Node doesn't emit MaxListenersExceededWarning on long chat streams.
+    res.setMaxListeners(20);
     res.on('close', () => activeRequests.delete(res));
     try {
       await route(req, res);

@@ -7,11 +7,12 @@ import { config, log } from '../config.js';
 import { timingSafeEqual } from 'crypto';
 import {
   getAccountList, getAccountCount, addAccountByKey, addAccountByToken,
+  addAccountByRefreshToken, addAccountByEmail,
   removeAccount, setAccountStatus, resetAccountErrors, updateAccountLabel,
   isAuthenticated, probeAccount, ensureLsForAccount,
   refreshCredits, refreshAllCredits,
   setAccountBlockedModels, fetchAndMergeModelCatalog,
-  setAccountTokens,
+  setAccountTokens, getInternalAccountView,
 } from '../auth.js';
 import { restartLsForProxy } from '../langserver.js';
 import { getLsStatus, stopLanguageServer, startLanguageServer, isLanguageServerRunning } from '../langserver.js';
@@ -56,13 +57,127 @@ function constantTimeEquals(a, b) {
 }
 
 function checkAuth(req) {
-  const pw = req.headers['x-dashboard-password'] || '';
+  // Primary channel: X-Dashboard-Password header. SSE clients (EventSource)
+  // can't set custom headers, so we also accept ?_pw=... as a fallback for
+  // the /dashboard/api/logs/stream endpoint. The query-string value is
+  // treated with the same timing-safe compare — no weakening of auth.
+  let pw = req.headers['x-dashboard-password'] || '';
+  if (!pw && req.url) {
+    try {
+      const u = new URL(req.url, 'http://localhost');
+      pw = u.searchParams.get('_pw') || '';
+    } catch {}
+  }
   // If dashboard password is set, use it
   if (config.dashboardPassword) return constantTimeEquals(pw, config.dashboardPassword);
   // Otherwise fall back to API key (if set)
   if (config.apiKey) return constantTimeEquals(pw, config.apiKey);
   // No password and no API key = open access
   return true;
+}
+
+// ── Brute-force guard for /dashboard/api/auth ────────────────
+// Simple in-memory throttle: after 5 failed /auth checks from the same IP
+// within a minute we start returning 429 with escalating lockouts. Not
+// bulletproof against a distributed attacker on a LAN, but denies the common
+// "point a script at http://127.0.0.1:20129 and iterate passwords" case.
+const _authAttempts = new Map(); // ip -> { count, firstAt, lockedUntil }
+const AUTH_WINDOW_MS = 60_000;
+const AUTH_MAX_ATTEMPTS = 5;
+const AUTH_BASE_LOCKOUT_MS = 30_000;
+
+function clientIp(req) {
+  return req.socket?.remoteAddress || req.connection?.remoteAddress || 'unknown';
+}
+
+function authThrottle(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  const entry = _authAttempts.get(ip);
+  if (!entry) return { allowed: true };
+  if (entry.lockedUntil && entry.lockedUntil > now) {
+    return { allowed: false, retryAfterMs: entry.lockedUntil - now };
+  }
+  if (now - entry.firstAt > AUTH_WINDOW_MS) {
+    _authAttempts.delete(ip);
+    return { allowed: true };
+  }
+  return { allowed: true };
+}
+
+function authRecordFailure(req) {
+  const ip = clientIp(req);
+  const now = Date.now();
+  let entry = _authAttempts.get(ip);
+  if (!entry || now - entry.firstAt > AUTH_WINDOW_MS) {
+    entry = { count: 0, firstAt: now, lockedUntil: 0 };
+  }
+  entry.count++;
+  if (entry.count >= AUTH_MAX_ATTEMPTS) {
+    // Exponential lockout: 30s, 60s, 120s, …, capped at 30 min
+    const mult = Math.min(2 ** (entry.count - AUTH_MAX_ATTEMPTS), 60);
+    entry.lockedUntil = now + Math.min(AUTH_BASE_LOCKOUT_MS * mult, 30 * 60_000);
+    log.warn(`Dashboard auth: ${entry.count} failures from ${ip}, locked ${Math.round((entry.lockedUntil - now) / 1000)}s`);
+  }
+  _authAttempts.set(ip, entry);
+}
+
+function authRecordSuccess(req) {
+  _authAttempts.delete(clientIp(req));
+}
+
+/**
+ * Add an account from any supported credential payload. Used by both the
+ * single-account POST and the batch importer so the same precedence and
+ * error handling apply everywhere.
+ *
+ * Precedence (first non-empty wins): api_key > id_token > refresh_token > token > email+password.
+ */
+async function addAccountFromCreds(creds) {
+  if (!creds || typeof creds !== 'object') throw new Error('Empty credentials payload');
+  const label = typeof creds.label === 'string' ? creds.label.trim() || undefined : undefined;
+
+  if (typeof creds.api_key === 'string' && creds.api_key.trim()) {
+    return addAccountByKey(creds.api_key.trim(), label);
+  }
+  if (typeof creds.id_token === 'string' && creds.id_token.trim()) {
+    // OAuth flow: Firebase idToken → Codeium register → API key. The caller
+    // is responsible for obtaining the idToken (e.g. Google sign-in popup),
+    // we just register it as a windbu account.
+    const proxy = creds.proxy?.host ? creds.proxy : (getProxyConfig().global || null);
+    const { apiKey, name } = await reRegisterWithCodeium(creds.id_token.trim(), proxy);
+    const account = addAccountByKey(apiKey, label || name || creds.email || 'OAuth');
+    if (creds.refresh_token) {
+      setAccountTokens(account.id, { refreshToken: creds.refresh_token, idToken: creds.id_token });
+    }
+    return account;
+  }
+  if (typeof creds.refresh_token === 'string' && creds.refresh_token.trim()) {
+    return addAccountByRefreshToken(creds.refresh_token.trim(), label);
+  }
+  if (typeof creds.token === 'string' && creds.token.trim()) {
+    return addAccountByToken(creds.token.trim(), label);
+  }
+  if (typeof creds.email === 'string' && typeof creds.password === 'string' && creds.email && creds.password) {
+    const proxy = creds.proxy?.host ? creds.proxy : null;
+    return addAccountByEmail(creds.email.trim(), creds.password, proxy);
+  }
+  throw new Error('Provide one of: api_key, token, refresh_token, id_token, or email+password');
+}
+
+/**
+ * Best-effort human-readable hint for failed batch entries — never includes
+ * the raw secret material, only the type and an opaque identifier (email or
+ * a short prefix) so the operator can spot which row failed.
+ */
+function describeCreds(creds) {
+  if (!creds || typeof creds !== 'object') return 'invalid';
+  if (creds.api_key) return `api_key:${String(creds.api_key).slice(0, 6)}…`;
+  if (creds.id_token) return `id_token (${creds.email || 'oauth'})`;
+  if (creds.refresh_token) return `refresh_token:${String(creds.refresh_token).slice(0, 6)}…`;
+  if (creds.token) return `token:${String(creds.token).slice(0, 6)}…`;
+  if (creds.email) return `email:${creds.email}`;
+  return 'unknown';
 }
 
 /**
@@ -80,7 +195,19 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   if (subpath === '/auth') {
     const needsAuth = !!(config.dashboardPassword || config.apiKey);
     if (!needsAuth) return json(res, 200, { required: false });
-    return json(res, 200, { required: true, valid: checkAuth(req) });
+    const throttle = authThrottle(req);
+    if (!throttle.allowed) {
+      res.setHeader?.('Retry-After', Math.ceil(throttle.retryAfterMs / 1000));
+      return json(res, 429, {
+        required: true, valid: false,
+        error: 'Too many failed auth attempts. Try again later.',
+        retry_after_ms: throttle.retryAfterMs,
+      });
+    }
+    const valid = checkAuth(req);
+    if (valid) authRecordSuccess(req);
+    else authRecordFailure(req);
+    return json(res, 200, { required: true, valid });
   }
 
   // ─── Overview ─────────────────────────────────────────
@@ -146,16 +273,34 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     return json(res, 200, { accounts: getAccountList() });
   }
 
+  // POST /accounts — add one account (any supported credential type)
+  //
+  // Body shape: pick exactly one of:
+  //   { api_key: "...", label? }                         — direct Codeium API key
+  //   { token: "ott$...", label? }                       — Windsurf one-time token / JWT
+  //   { refresh_token: "...", label? }                   — Firebase refresh token
+  //   { email, password, label?, proxy? }                — direct Windsurf login
+  //   { id_token: "...", label?, email? }                — OAuth idToken (Google/GitHub via Firebase)
+  //
+  // Or a batch payload: { accounts: [<any-of-above>, ...] }
   if (subpath === '/accounts' && method === 'POST') {
-    try {
-      let account;
-      if (body.api_key) {
-        account = addAccountByKey(body.api_key, body.label);
-      } else if (body.token) {
-        account = await addAccountByToken(body.token, body.label);
-      } else {
-        return json(res, 400, { error: 'Provide api_key or token' });
+    // Batch path (used by Add Account → Bulk import).
+    if (Array.isArray(body?.accounts)) {
+      const results = [];
+      for (const acct of body.accounts) {
+        try {
+          const account = await addAccountFromCreds(acct);
+          probeAccount(account.id).catch(e => log.warn(`Auto-probe failed: ${e.message}`));
+          results.push({ ok: true, id: account.id, email: account.email, method: account.method, status: account.status });
+        } catch (err) {
+          results.push({ ok: false, error: err.message, hint: describeCreds(acct) });
+        }
       }
+      return json(res, 200, { success: true, results, ...getAccountCount() });
+    }
+
+    try {
+      const account = await addAccountFromCreds(body || {});
       // Fire-and-forget probe so the UI gets tier info shortly after add
       probeAccount(account.id).catch(e => log.warn(`Auto-probe failed: ${e.message}`));
       return json(res, 200, {
@@ -493,7 +638,9 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
       return json(res, 200, {
         success: true,
-        apiKey: result.apiKey,
+        // Never echo the raw Windsurf apiKey back to the caller — the
+        // account is already stored in the pool; the dashboard only needs
+        // the stable id to render the row.
         name: result.name,
         email: result.email,
         apiServerUrl: result.apiServerUrl,
@@ -527,7 +674,6 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
       return json(res, 200, {
         success: true,
-        apiKey,
         name,
         email: email || '',
         account: account ? { id: account.id, email: account.email, status: account.status } : null,
@@ -541,7 +687,9 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // POST /accounts/:id/rate-limit — check capacity for a single account
   const rateLimitCheck = subpath.match(/^\/accounts\/([^/]+)\/rate-limit$/);
   if (rateLimitCheck && method === 'POST') {
-    const list = getAccountList();
+    // Public view from getAccountList() strips apiKey; use the internal
+    // view to get the actual key so checkMessageRateLimit can call upstream.
+    const list = getInternalAccountView();
     const acct = list.find(a => a.id === rateLimitCheck[1]);
     if (!acct) return json(res, 404, { error: 'Account not found' });
     try {
@@ -557,7 +705,8 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
   // POST /accounts/:id/refresh-token — manually refresh Firebase token
   const tokenRefresh = subpath.match(/^\/accounts\/([^/]+)\/refresh-token$/);
   if (tokenRefresh && method === 'POST') {
-    const list = getAccountList();
+    // Internal view carries apiKey + refreshToken so we can actually rotate.
+    const list = getInternalAccountView();
     const acct = list.find(a => a.id === tokenRefresh[1]);
     if (!acct) return json(res, 404, { error: 'Account not found' });
     if (!acct.refreshToken) return json(res, 400, { error: 'Account has no refresh token' });

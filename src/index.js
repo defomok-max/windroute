@@ -17,8 +17,8 @@ import { startServer } from './server.js';
 import { config, log } from './config.js';
 import { runPreflight } from './preflight.js';
 import { flushStatsSync } from './dashboard/stats.js';
-import { existsSync, mkdirSync, rmSync, readdirSync } from 'fs';
-import { join } from 'path';
+import { existsSync, mkdirSync, rmSync, readdirSync, writeFileSync, unlinkSync } from 'fs';
+import { join, resolve, relative } from 'path';
 import { BRAND, VERSION } from './version.js';
 
 // ── Global error handlers ─────────────────────────────────
@@ -39,6 +39,10 @@ process.on('uncaughtException', (err, origin) => {
   // leaving the process in a half-dead state.
   try { flushStatsSync(); } catch {}
   try { stopLanguageServer(); } catch {}
+  try {
+    const pidFile = join(config.dataDir, 'windbu.pid');
+    if (existsSync(pidFile)) unlinkSync(pidFile);
+  } catch {}
   process.exit(1);
 });
 
@@ -65,9 +69,21 @@ async function main() {
     try {
       // Wipe workspace on every boot — Cascade leaves artifacts from previous
       // chats that bleed into the next session's system prompt otherwise.
-      try { mkdirSync(config.workspaceDir, { recursive: true }); } catch {}
-      for (const entry of readdirSync(config.workspaceDir)) {
-        try { rmSync(join(config.workspaceDir, entry), { recursive: true, force: true }); } catch {}
+      //
+      // Hard guard: only wipe when workspaceDir is a proper subdirectory of
+      // dataDir. Otherwise a hand-edited WINDBU_WORKSPACE_DIR could point at
+      // the user's home or drive root and we'd recursively delete live data.
+      const ws = resolve(config.workspaceDir);
+      const dd = resolve(config.dataDir);
+      const rel = relative(dd, ws);
+      const safeToWipe = !!rel && !rel.startsWith('..') && !/^[A-Za-z]:/.test(rel);
+      if (safeToWipe) {
+        try { mkdirSync(ws, { recursive: true }); } catch {}
+        for (const entry of readdirSync(ws)) {
+          try { rmSync(join(ws, entry), { recursive: true, force: true }); } catch {}
+        }
+      } else {
+        log.warn(`workspaceDir (${ws}) is not inside dataDir (${dd}) — skipping boot-time cleanup`);
       }
     } catch {}
 
@@ -99,6 +115,16 @@ async function main() {
 
   const server = startServer();
 
+  // Write pidfile so `windbu stop` (bin/windbu.mjs) can find this process.
+  // Without this the CLI's stop command logs "No PID file found" and silently
+  // fails to kill the running gateway.
+  const pidFile = join(config.dataDir, 'windbu.pid');
+  try { writeFileSync(pidFile, String(process.pid), 'utf-8'); }
+  catch (e) { log.warn(`Could not write pidfile ${pidFile}: ${e.message}`); }
+  const cleanupPidFile = () => {
+    try { if (existsSync(pidFile)) unlinkSync(pidFile); } catch {}
+  };
+
   let shuttingDown = false;
   const shutdown = (signal) => {
     if (shuttingDown) return;
@@ -110,12 +136,14 @@ async function main() {
       log.info('HTTP server closed, stopping language server');
       try { flushStatsSync(); } catch {}
       try { stopLanguageServer(); } catch {}
+      cleanupPidFile();
       process.exit(0);
     });
     setTimeout(() => {
       log.warn('Drain timeout, forcing exit');
       try { flushStatsSync(); } catch {}
       try { stopLanguageServer(); } catch {}
+      cleanupPidFile();
       process.exit(0);
     }, 30_000);
   };
