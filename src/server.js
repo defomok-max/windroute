@@ -32,25 +32,24 @@ import { BRAND, VERSION } from './version.js';
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 function readBody(req) {
-  // Cap body size to protect against memory exhaustion attacks. 25 MB is
-  // generous enough for big multimodal messages (images are base64, ~1.33×
-  // the binary size) without letting an attacker tip over the process by
-  // sending GB of garbage.
   const MAX_BODY = 25 * 1024 * 1024;
   return new Promise((resolve, reject) => {
     const chunks = [];
     let size = 0;
+    let settled = false;
+    const done = (fn, ...args) => { if (settled) return; settled = true; fn(...args); };
     req.on('data', c => {
+      if (settled) return;
       size += c.length;
       if (size > MAX_BODY) {
-        reject(new Error(`Request body exceeds ${MAX_BODY} bytes`));
+        done(reject, new Error(`Request body exceeds ${MAX_BODY} bytes`));
         req.destroy();
         return;
       }
       chunks.push(c);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    req.on('error', reject);
+    req.on('end', () => done(resolve, Buffer.concat(chunks).toString('utf-8')));
+    req.on('error', (err) => done(reject, err));
   });
 }
 

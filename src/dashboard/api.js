@@ -126,6 +126,16 @@ function authRecordSuccess(req) {
   _authAttempts.delete(clientIp(req));
 }
 
+// Periodic cleanup of stale auth-throttle entries to prevent unbounded growth.
+// Runs every 5 minutes; entries older than AUTH_WINDOW_MS are evicted.
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of _authAttempts) {
+    const expired = (now - entry.firstAt > AUTH_WINDOW_MS) && (!entry.lockedUntil || entry.lockedUntil <= now);
+    if (expired) _authAttempts.delete(ip);
+  }
+}, 5 * 60_000).unref?.();
+
 /**
  * Add an account from any supported credential payload. Used by both the
  * single-account POST and the batch importer so the same precedence and

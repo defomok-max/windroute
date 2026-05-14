@@ -99,12 +99,17 @@ export function unwrapRequest(body, headers = {}) {
  * Stateful parser that buffers incoming data and yields complete frames.
  */
 export class StreamingFrameParser {
-  constructor() {
+  constructor(maxBufferSize = 50 * 1024 * 1024) {
     this.buffer = Buffer.alloc(0);
+    this.maxBufferSize = maxBufferSize;
   }
 
   push(chunk) {
     this.buffer = Buffer.concat([this.buffer, chunk]);
+    if (this.buffer.length > this.maxBufferSize) {
+      this.buffer = Buffer.alloc(0);
+      throw new Error(`StreamingFrameParser: buffer exceeded ${this.maxBufferSize} bytes, reset`);
+    }
   }
 
   /** Drain all complete frames. Returns [{ flags, isEndStream, payload }]. */

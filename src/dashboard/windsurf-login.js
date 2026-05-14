@@ -69,12 +69,11 @@ function generateFingerprint() {
 
 function createProxyTunnel(proxy, targetHost, targetPort) {
   return new Promise((resolve, reject) => {
-    const proxyHost = proxy.host.replace(/:\d+$/, '');
+    // Don't strip ":<digits>" off proxy.host — that breaks IPv6 literals like
+    // "::1" (the last segment "::1" looks like a port suffix to the regex).
+    // Use proxy.host as-is and rely on proxy.port for the proxy port.
+    const proxyHost = proxy.host;
     const proxyPort = proxy.port || 8080;
-
-    const authHeader = proxy.username
-      ? `Proxy-Authorization: Basic ${Buffer.from(`${proxy.username}:${proxy.password || ''}`).toString('base64')}\r\n`
-      : '';
 
     const connectReq = http.request({
       host: proxyHost,
@@ -104,61 +103,54 @@ function createProxyTunnel(proxy, targetHost, targetPort) {
 
 // ─── HTTPS request with optional proxy ────────────────────
 
-function httpsRequest(url, opts, postData, proxy) {
-  return new Promise(async (resolve, reject) => {
-    const parsed = new URL(url);
-    const requestOpts = {
-      hostname: parsed.hostname,
-      port: 443,
-      path: parsed.pathname + parsed.search,
-      method: opts.method || 'POST',
-      headers: opts.headers || {},
-    };
+async function httpsRequest(url, opts, postData, proxy) {
+  const parsed = new URL(url);
+  const requestOpts = {
+    hostname: parsed.hostname,
+    port: 443,
+    path: parsed.pathname + parsed.search,
+    method: opts.method || 'POST',
+    headers: opts.headers || {},
+  };
 
-    const handleResponse = (res) => {
+  if (proxy && proxy.host) {
+    const socket = await createProxyTunnel(proxy, parsed.hostname, 443);
+    requestOpts.socket = socket;
+    requestOpts.agent = false;
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, ...args) => { if (settled) return; settled = true; fn(...args); };
+
+    const req = https.request(requestOpts, (res) => {
       const bufs = [];
       res.on('data', d => bufs.push(d));
       res.on('end', () => {
         let raw = Buffer.concat(bufs);
-        // Decompress if upstream (or an intermediate proxy) decided to wrap
-        // the response body. Our request explicitly sends Accept-Encoding:
-        // identity, but middleboxes don't always honour that.
         const enc = String(res.headers['content-encoding'] || '').toLowerCase();
         try {
           if (enc === 'gzip') raw = gunzipSync(raw);
           else if (enc === 'deflate') raw = inflateSync(raw);
           else if (enc === 'br') raw = brotliDecompressSync(raw);
         } catch (e) {
-          return reject(new Error(`Decompress failed (encoding=${enc}): ${e.message}`));
+          done(reject, new Error(`Decompress failed (encoding=${enc}): ${e.message}`));
+          return;
         }
         const text = raw.toString('utf8');
         try {
-          resolve({ status: res.statusCode, data: JSON.parse(text) });
+          done(resolve, { status: res.statusCode, data: JSON.parse(text) });
         } catch {
-          reject(new Error(`Parse error (status ${res.statusCode}, encoding ${enc || 'identity'}): ${text.slice(0, 200)}`));
+          done(reject, new Error(`Parse error (status ${res.statusCode}, encoding ${enc || 'identity'}): ${text.slice(0, 200)}`));
         }
       });
-      res.on('error', reject);
-    };
+      res.on('error', (err) => done(reject, err));
+    });
 
-    try {
-      let req;
-      if (proxy && proxy.host) {
-        const socket = await createProxyTunnel(proxy, parsed.hostname, 443);
-        requestOpts.socket = socket;
-        requestOpts.agent = false;
-        req = https.request(requestOpts, handleResponse);
-      } else {
-        req = https.request(requestOpts, handleResponse);
-      }
-
-      req.on('error', (err) => reject(new Error(`Request error: ${err.message}`)));
-      req.setTimeout(30000, () => { req.destroy(); reject(new Error('Request timeout')); });
-      if (postData) req.write(postData);
-      req.end();
-    } catch (err) {
-      reject(err);
-    }
+    req.on('error', (err) => done(reject, new Error(`Request error: ${err.message}`)));
+    req.setTimeout(30000, () => { req.destroy(); done(reject, new Error('Request timeout')); });
+    if (postData) req.write(postData);
+    req.end();
   });
 }
 
@@ -222,7 +214,7 @@ export async function windsurfLogin(email, password, proxy = null) {
     throw new Error(`Codeium registration failed: ${JSON.stringify(regRes.data).slice(0, 200)}`);
   }
 
-  log.info(`Codeium register OK: ${email} → key=${regRes.data.api_key.slice(0, 12)}...`);
+    log.info(`Codeium register OK: ${email} → key=${regRes.data.api_key.slice(0, 6)}…`);
 
   return {
     apiKey: regRes.data.api_key,

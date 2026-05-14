@@ -32,7 +32,7 @@ const RATE_LIMIT_PATH = '/exa.api_server_pb.ApiServerService/CheckUserMessageRat
 // so per-account outbound IPs stay consistent across login and credit fetch.
 function createProxyTunnel(proxy, targetHost, targetPort) {
   return new Promise((resolve, reject) => {
-    const proxyHost = proxy.host.replace(/:\d+$/, '');
+    const proxyHost = proxy.host.includes(':') ? proxy.host : proxy.host.replace(/:\d+$/, '');
     const proxyPort = proxy.port || 8080;
     const req = http.request({
       host: proxyHost,
@@ -62,23 +62,33 @@ function isProxyError(err) {
   return /Proxy CONNECT failed|Proxy tunnel|Proxy connection/i.test(m);
 }
 
-function postJson(host, path, body, proxy) {
-  return new Promise(async (resolve, reject) => {
-    const postData = JSON.stringify(body);
-    const opts = {
-      hostname: host,
-      port: 443,
-      path,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-        'Connect-Protocol-Version': '1',
-        'Accept': 'application/json',
-        'User-Agent': 'windsurf/1.108.2',
-      },
-    };
-    const onRes = (res) => {
+async function postJson(host, path, body, proxy) {
+  const postData = JSON.stringify(body);
+  const opts = {
+    hostname: host,
+    port: 443,
+    path,
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(postData),
+      'Connect-Protocol-Version': '1',
+      'Accept': 'application/json',
+      'User-Agent': 'windsurf/1.108.2',
+    },
+  };
+
+  if (proxy && proxy.host) {
+    const socket = await createProxyTunnel(proxy, host, 443);
+    opts.socket = socket;
+    opts.agent = false;
+  }
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const done = (fn, ...args) => { if (settled) return; settled = true; fn(...args); };
+
+    const req = https.request(opts, (res) => {
       const bufs = [];
       res.on('data', d => bufs.push(d));
       res.on('end', () => {
@@ -89,34 +99,23 @@ function postJson(host, path, body, proxy) {
           else if (enc === 'deflate') body = inflateSync(body);
           else if (enc === 'br') body = brotliDecompressSync(body);
         } catch (e) {
-          reject(new Error(`Decompress failed (encoding=${enc}): ${e.message}`));
+          done(reject, new Error(`Decompress failed (encoding=${enc}): ${e.message}`));
           return;
         }
         const raw = body.toString('utf8');
         try {
           const parsed = raw ? JSON.parse(raw) : {};
-          resolve({ status: res.statusCode, data: parsed, raw });
+          done(resolve, { status: res.statusCode, data: parsed, raw });
         } catch {
-          reject(new Error(`Non-JSON response (${res.statusCode}): ${raw.slice(0, 200)}`));
+          done(reject, new Error(`Non-JSON response (${res.statusCode}): ${raw.slice(0, 200)}`));
         }
       });
-      res.on('error', reject);
-    };
-    try {
-      let req;
-      if (proxy && proxy.host) {
-        const socket = await createProxyTunnel(proxy, host, 443);
-        opts.socket = socket;
-        opts.agent = false;
-        req = https.request(opts, onRes);
-      } else {
-        req = https.request(opts, onRes);
-      }
-      req.on('error', (err) => reject(new Error(`Request: ${err.message}`)));
-      req.setTimeout(20000, () => { req.destroy(); reject(new Error('Request timeout')); });
-      req.write(postData);
-      req.end();
-    } catch (err) { reject(err); }
+      res.on('error', (err) => done(reject, err));
+    });
+    req.on('error', (err) => done(reject, new Error(`Request: ${err.message}`)));
+    req.setTimeout(20000, () => { req.destroy(); done(reject, new Error('Request timeout')); });
+    req.write(postData);
+    req.end();
   });
 }
 

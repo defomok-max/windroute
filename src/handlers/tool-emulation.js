@@ -223,16 +223,27 @@ export function normalizeMessagesForCascade(messages, tools) {
  * next delta.
  */
 export class ToolCallStreamParser {
-  constructor() {
+  constructor(maxBufferSize = 1024 * 1024) {
     this.buffer = '';
     this.inToolCall = false;
     this.inToolResult = false;
     this._totalSeen = 0;
+    this._maxBufferSize = maxBufferSize;
   }
 
   feed(delta) {
     if (!delta) return { text: '', toolCalls: [] };
     this.buffer += delta;
+
+    // Guard against unbounded buffer growth (e.g. model emits <tool_call> but
+    // never closes it). If exceeded, flush the buffer as literal text.
+    if (this.buffer.length > this._maxBufferSize) {
+      const flushed = this.buffer;
+      this.buffer = '';
+      this.inToolCall = false;
+      this.inToolResult = false;
+      return { text: flushed, toolCalls: [] };
+    }
     const safeParts = [];
     const doneCalls = [];
     const TC_OPEN = '<tool_call>';
