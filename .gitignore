@@ -15,9 +15,19 @@ stats.json
 model-access.json
 runtime-config.json
 
-# локальные тестовые артефакты
+# локальные тестовые артефакты (ad-hoc dev scratch files at repo root)
 _boot.out
 _boot.err
+_test.pid
+_smoke.out
+_smoke.err
+_*.ps1
+_*.mjs
+_*.js
+src/dashboard/_*.html
+src/dashboard/_*.mjs
+src/dashboard/_*.js
+src/dashboard/index.legacy.html
 
 # tooling state
 .serena/

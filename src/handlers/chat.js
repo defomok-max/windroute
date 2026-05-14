@@ -264,9 +264,19 @@ export async function handleChatCompletions(body, deps = {}) {
   // through every account trying to find one. This surfaces tier
   // entitlement and blocklist errors as a clean 403 rather than a 30s
   // queue timeout → pool_exhausted.
-  const anyEligible = getAccountList().some(a =>
-    a.status === 'active' && (a.availableModels || []).includes(modelKey)
-  );
+  //
+  // IMPORTANT: freshly-added accounts have tier='unknown' until the first
+  // probe completes (~10 seconds after POST /auth/login). Their
+  // availableModels therefore lists only the free-tier canaries, so a 403
+  // here would block every Claude/GPT request during that warmup window.
+  // Treat any un-probed active account as eligible and let the real call
+  // surface entitlement errors through the normal retry loop.
+  const anyEligible = getAccountList().some(a => {
+    if (a.status !== 'active') return false;
+    const unprobed = !a.lastProbed || a.tier === 'unknown';
+    if (unprobed) return true;
+    return (a.availableModels || []).includes(modelKey);
+  });
   if (!anyEligible) {
     return {
       status: 403,

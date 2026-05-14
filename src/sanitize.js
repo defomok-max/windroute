@@ -39,6 +39,19 @@ function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// Windows-style absolute paths may appear in model output with either
+// backslash or forward-slash separators depending on which quoting context
+// the text came through. We normalise every dynamic literal into both
+// variants so both the regex pattern and the streaming cut-point detector
+// recognise the path regardless of separator.
+function pathVariants(p) {
+  if (typeof p !== 'string' || !p) return [];
+  const variants = new Set([p]);
+  if (p.includes('\\')) variants.add(p.replace(/\\/g, '/'));
+  if (p.includes('/'))  variants.add(p.replace(/\//g, '\\'));
+  return Array.from(variants);
+}
+
 // Build the list of path prefixes to scrub. Kept as literals so we can also
 // check them in PathSanitizeStream's cut-point logic below.
 const SENSITIVE_LITERALS = [
@@ -47,13 +60,19 @@ const SENSITIVE_LITERALS = [
   '/opt/windsurf',
   '/root/WindsurfPoolAPI',
 ];
-if (_repoRoot.length > 10 && !SENSITIVE_LITERALS.includes(_repoRoot)) {
-  SENSITIVE_LITERALS.push(_repoRoot);
+if (_repoRoot.length > 10) {
+  for (const v of pathVariants(_repoRoot)) {
+    if (!SENSITIVE_LITERALS.includes(v)) SENSITIVE_LITERALS.push(v);
+  }
 }
 // windbu's runtime workspace dir (host-absolute path; on Windows this is
-// typically "C:\Users\<user>\.windbu\workspace"). Include it so the model
-// can't leak the real filesystem location.
-if (config?.workspaceDir) SENSITIVE_LITERALS.push(config.workspaceDir);
+// typically "C:\Users\<user>\.windbu\workspace"). Include both slash
+// variants so the model can't sneak the leak past by flipping separators.
+if (config?.workspaceDir) {
+  for (const v of pathVariants(config.workspaceDir)) {
+    if (!SENSITIVE_LITERALS.includes(v)) SENSITIVE_LITERALS.push(v);
+  }
+}
 
 const PATTERNS = [
   [/\/tmp\/windsurf-workspace(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
@@ -65,13 +84,17 @@ const PATTERNS = [
   [/\/root\/WindsurfPoolAPI(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
 ];
 // Dynamic repo-root pattern — only when the path is long enough to avoid
-// overly-broad matches (e.g. root "/" or "/tmp").
+// overly-broad matches (e.g. root "/" or "/tmp"). Register both slash
+// variants because Windows paths can surface either way.
 if (_repoRoot.length > 10 && _repoRoot !== '/root/WindsurfPoolAPI') {
-  PATTERNS.push([new RegExp(escapeRegex(_repoRoot) + '(?:[\\\\/][^\\s"\'`<>)}\\],*;]*)?', 'g'), '[internal]']);
+  for (const v of pathVariants(_repoRoot)) {
+    PATTERNS.push([new RegExp(escapeRegex(v) + '(?:[\\\\/][^\\s"\'`<>)}\\],*;]*)?', 'g'), '[internal]']);
+  }
 }
-// Runtime workspace dir — matches both forward and backward separators.
 if (config?.workspaceDir) {
-  PATTERNS.push([new RegExp(escapeRegex(config.workspaceDir) + '(?:[\\\\/][^\\s"\'`<>)}\\],*;]*)?', 'g'), '[workspace]']);
+  for (const v of pathVariants(config.workspaceDir)) {
+    PATTERNS.push([new RegExp(escapeRegex(v) + '(?:[\\\\/][^\\s"\'`<>)}\\],*;]*)?', 'g'), '[workspace]']);
+  }
 }
 
 // Character class that counts as part of a path body. Mirrors the PATTERNS
